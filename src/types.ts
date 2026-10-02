@@ -47,76 +47,64 @@ export interface ToolCall {
   pinned: boolean;
 }
 
-export interface CallAnswer {
-  /** The model's probability that the call itself still matters. */
-  keepCall: number;
-  /** The model's probability that the full result still needs to stay verbatim. */
-  keepResult: number;
-}
+/** How costly it would be to get a call's output again by re-running it. */
+export type RerunCost = 'cheap' | 'expensive' | 'unknown';
 
-export type CallAction = 'keep' | 'drop_result' | 'drop_call';
+/** Removal-first: a result is dropped (head kept) unless it is spared. */
+export type CallAction = 'keep' | 'drop_result';
 
-export interface CallDecision extends CallAnswer {
+export type DecisionReason =
+  /** In the first or newest preserved messages. */
+  | 'pinned'
+  /** A rule says re-running is expensive. */
+  | 'expensive'
+  /** A rule says re-running is cheap. */
+  | 'cheap'
+  /** No rule applied; the model judged it expensive. */
+  | 'model_spared'
+  /** No rule applied; the model judged it cheap. */
+  | 'model_dropped'
+  /** No rule applied and the model could not be asked; kept to be safe. */
+  | 'model_unavailable';
+
+export interface CallDecision {
   id: string;
   tool: string;
   action: CallAction;
-  reason: 'pinned' | 'kept' | 'result_dropped' | 'call_dropped';
-}
-
-export interface HistoryToolCall {
-  id: string;
-  tool: string;
-  input: string;
-  result: string;
-}
-
-export interface HistoryEntry {
-  i: number;
-  role: Role;
-  text: string;
-  /** Structured per call, or one compact line per call once the state has to shrink. */
-  tool_calls?: HistoryToolCall[] | string[];
-}
-
-/** The outline shared by every decision item: the whole history, results omitted. */
-export interface CompactionState {
-  context: string;
-  goal: string;
-  history: HistoryEntry[];
-}
-
-export interface FittedState {
-  state: CompactionState;
-  tokens: number;
-  /** Which fitting stage produced the state, for diagnostics. */
-  stage: string;
+  reason: DecisionReason;
+  cost: RerunCost;
+  /** The model's P(expensive to re-run), when it was asked. */
+  pExpensive?: number;
 }
 
 export interface CompactOptions {
-  /** Ongoing task description; defaults to the last few user prompts. */
-  goal?: string;
-  /** Minimum keep probability for a call or result to stay. Default 0.5. */
-  keepThreshold?: number;
   /** Newest messages never touched (the first message is always kept). Default 6. */
   preserveRecentMessages?: number;
-  /** Estimated token ceiling for the shared outline. Default 3000. */
-  maxStateTokens?: number;
-  /** Characters of a call's result shown in its focus block. Default 1500. */
+  /** Minimum model P(expensive) for an unclassified result to be spared. Default 0.7. */
+  spareThreshold?: number;
+  /** Extra tool-name globs whose output is cheap to get again (win over defaults). */
+  cheapTools?: readonly string[];
+  /** Extra tool-name globs whose output is expensive to get again (win over defaults). */
+  expensiveTools?: readonly string[];
+  /** Characters of a call's result shown to the model. Default 1500. */
   focusResultChars?: number;
   /** Decision items sent per server request. Default 128. */
   maxRequestItems?: number;
   /** Characters of a dropped tool result to retain. Default 300. */
   truncateHeadChars?: number;
+  /** Characters kept of each long string input field of a dropped call. Default 300. */
+  truncateInputChars?: number;
 }
 
 export interface ResolvedCompactOptions {
-  goal: string;
-  keepThreshold: number;
   preserveRecentMessages: number;
-  maxStateTokens: number;
+  spareThreshold: number;
+  cheapTools: readonly string[];
+  expensiveTools: readonly string[];
   focusResultChars: number;
   maxRequestItems: number;
   truncateHeadChars: number;
+  truncateInputChars: number;
 }
 
 export interface CompactResult {
@@ -129,14 +117,16 @@ export interface CompactResult {
     charsBefore: number;
     charsAfter: number;
     calls: number;
+    /** Results left verbatim (spared or pinned). */
     kept: number;
     resultsDropped: number;
-    callsDropped: number;
     pinned: number;
-    /** Estimated tokens of the shared outline. */
-    stateTokens: number;
-    /** Which fitting stage the outline needed, '' when no request was made. */
-    stateStage: string;
+    /** Candidates a rule decided without the model. */
+    byRule: number;
+    /** Candidates the model was asked about. */
+    byModel: number;
+    /** Why the model could not be asked, when it could not. */
+    modelError?: string;
     requests: number;
     /** Model time the server reported, summed over requests. */
     modelMs: number;

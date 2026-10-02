@@ -11,7 +11,7 @@ services:
     ports:
       - "${FGC_BIND:-127.0.0.1}:${FGC_PORT:-8765}:8765"
     environment:
-      FGC_MODELS: ${FGC_MODELS:-gliner-decide,gliner-decide-1b}
+      FGC_MODELS: ${FGC_MODELS:-gliner-decide-1b}
       FGC_TOKEN: ${FGC_TOKEN:-}
       FGC_HALF: ${FGC_HALF:-1}
       FGC_BATCH_SIZE: ${FGC_BATCH_SIZE:-16}

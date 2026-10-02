@@ -64,16 +64,33 @@ function optionString(options: PluginOptions, key: string): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
+/** A comma-separated tool glob list option, or undefined when unset. */
+function optionList(options: PluginOptions, key: string): string[] | undefined {
+  const list = optionString(options, key)
+    ?.split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+  return list && list.length > 0 ? list : undefined;
+}
+
 /** Reads the plugin's `userConfig` values; anything missing takes the defaults. */
 export function resolveHookConfig(options: PluginOptions): HookConfig {
-  const numbers: Partial<Omit<CompactOptions, 'goal'>> = {};
+  const numbers: Pick<
+    CompactOptions,
+    | 'spareThreshold'
+    | 'preserveRecentMessages'
+    | 'focusResultChars'
+    | 'maxRequestItems'
+    | 'truncateHeadChars'
+    | 'truncateInputChars'
+  > = {};
   for (const key of [
-    'keepThreshold',
+    'spareThreshold',
     'preserveRecentMessages',
-    'maxStateTokens',
     'focusResultChars',
     'maxRequestItems',
     'truncateHeadChars',
+    'truncateInputChars',
   ] as const) {
     const value = options[key];
     if (typeof value === 'number' && Number.isFinite(value)) numbers[key] = value;
@@ -91,8 +108,10 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
   };
   const serverToken = optionString(options, 'serverToken');
   if (serverToken) config.serverToken = serverToken;
-  const goal = optionString(options, 'goal');
-  if (goal) config.goal = goal;
+  const cheapTools = optionList(options, 'cheapTools');
+  if (cheapTools) config.cheapTools = cheapTools;
+  const expensiveTools = optionList(options, 'expensiveTools');
+  if (expensiveTools) config.expensiveTools = expensiveTools;
   return config;
 }
 
@@ -179,7 +198,10 @@ export type SessionCompaction = {
   messages: SessionMessage[];
 };
 
-/** Runs the library over a session transcript; throws when the decision server fails. */
+/**
+ * Runs the library over a session transcript. A failing decision server does
+ * not throw: unclassified results are kept and `result.stats.modelError` says why.
+ */
 export async function compactSession(
   messages: readonly SessionMessage[],
   config: HookConfig,
@@ -200,15 +222,16 @@ function percent(ratio: number): string {
 
 export function summarize(result: CompactResult): string {
   const { stats } = result;
+  const spared = stats.kept - stats.pinned;
   const parts = [
-    stats.kept > 0 ? `${stats.kept} kept` : '',
     stats.resultsDropped > 0 ? `${stats.resultsDropped} results truncated` : '',
-    stats.callsDropped > 0 ? `${stats.callsDropped} call_dropped` : '',
+    spared > 0 ? `${spared} spared as expensive` : '',
     stats.pinned > 0 ? `${stats.pinned} pinned` : '',
   ].filter(Boolean);
-  return `${percent(reductionRatio(result))} reduction; ${
-    parts.join(', ') || 'no tool calls'
-  }; outline ~${stats.stateTokens} tokens (${stats.stateStage}), ${stats.requests} request(s), model ${stats.modelMs}ms`;
+  const model = stats.modelError
+    ? `model unavailable, ${stats.calls - stats.pinned - stats.byRule} unclassified kept (${stats.modelError})`
+    : `${stats.byRule} by rule, ${stats.byModel} by model in ${stats.modelMs}ms`;
+  return `${percent(reductionRatio(result))} reduction; ${parts.join(', ') || 'no tool calls'}; ${model}`;
 }
 
 const UI_LOG_MAX_CHARS = 4096;
@@ -218,7 +241,7 @@ export function decisionLog(result: CompactResult): string {
     .filter((d) => d.reason !== 'pinned')
     .map(
       (d) =>
-        `${d.id}:${d.tool}:${d.action}/call=${d.keepCall.toFixed(2)}/result=${d.keepResult.toFixed(2)}`,
+        `${d.id}:${d.tool}:${d.action}/${d.reason}${d.pExpensive === undefined ? '' : `=${d.pExpensive.toFixed(2)}`}`,
     )
     .join(' ');
 }

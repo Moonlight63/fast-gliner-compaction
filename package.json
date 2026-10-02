@@ -1,6 +1,6 @@
 {
   "name": "fast-gliner-compaction",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Verbatim context compaction for LLM agents, scored by a self-hosted GLiNER2.5 decision model.",
   "type": "module",
   "license": "MIT",

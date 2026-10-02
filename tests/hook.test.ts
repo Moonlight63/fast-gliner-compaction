@@ -7,7 +7,7 @@ import {
   summarize,
   toSessionMessages,
 } from '../hooks/fast-gliner.ts';
-import { applyDecisions, collectToolCalls, decideCall, type Message } from '../src/index.js';
+import { applyDecisions, collectToolCalls, type CallDecision, type Message } from '../src/index.js';
 
 type SessionMessage = Message & { handle?: string };
 
@@ -27,67 +27,64 @@ function result(id: string, text: string, isError = false): SessionMessage {
 }
 
 const fileA = 'export const a = 1;\n'.repeat(50);
+const scriptOut = 'row\n'.repeat(300);
 
+/** t1 Read (cheap by rule), t2 node script (left to the model). */
 function transcript(): SessionMessage[] {
   return [
     message('user', 'Fix the failing test.', { handle: 'h-0' }),
     call('tool-1', 'Read', { file_path: 'src/a.ts' }, fileA),
     result('tool-1', fileA),
-    call('tool-2', 'Bash', { command: 'npm test' }, 'FAIL'),
-    result('tool-2', 'FAIL b.test.ts: expected 2 to be 3', true),
+    call('tool-2', 'Bash', { command: 'node scripts/report.mjs' }, scriptOut),
+    result('tool-2', scriptOut),
     message('assistant', 'Fixing now.', { handle: 'h-5' }),
     message('user', 'go ahead', { handle: 'h-6' }),
   ];
 }
 
-/** A fake decision server: `answer(question, item)` gives P(yes). */
-function serverFetch(answer: (question: string, item: string) => number, calls: { url: string; body: string }[] = []) {
+/** A fake decision server answering P(expensive) for every item. */
+function serverFetch(p: number, calls: { url: string; body: string }[] = []) {
   return async (url: string, init?: { body?: string }) => {
     calls.push({ url, body: init?.body ?? '' });
-    const { questions, items } = JSON.parse(init?.body ?? '{}') as {
-      questions: Record<string, string>;
-      items: string[];
-    };
-    const answers = items.map((item) =>
-      Object.fromEntries(Object.keys(questions).map((key) => [key, answer(key, item)])),
-    );
-    return { status: 200, ok: true, text: JSON.stringify({ answers, ms: 5 }) };
+    const { items } = JSON.parse(init?.body ?? '{}') as { items: string[] };
+    return { status: 200, ok: true, text: JSON.stringify({ answers: items.map(() => ({ expensive: p })), ms: 5 }) };
   };
 }
-
-const keepT2 = (_question: string, item: string) => (item.startsWith('[focus] tool call t2 ') ? 0.9 : 0.1);
 
 describe('hook config', () => {
   it('reads userConfig values and falls back to defaults', () => {
     expect(resolveHookConfig({})).toEqual({
       compactAtPercent: 60,
       minReductionRatio: 0.25,
-      model: 'gliner-decide',
+      model: 'gliner-decide-1b',
       serverUrl: 'http://127.0.0.1:8765',
     });
     expect(
       resolveHookConfig({
         serverUrl: 'http://172.16.16.125:8765',
         serverToken: 't',
-        keepThreshold: 0.3,
-        maxStateTokens: 1000,
-        focusResultChars: 800,
-        model: 'gliner-decide-1b',
-        goal: 'g',
+        spareThreshold: 0.9,
+        truncateInputChars: 200,
+        cheapTools: ' mcp__db__query, Foo ',
+        expensiveTools: 'Bar',
+        model: 'gliner25-multi',
         compactAtPercent: 'no',
       }),
     ).toEqual({
       serverUrl: 'http://172.16.16.125:8765',
       serverToken: 't',
-      keepThreshold: 0.3,
-      maxStateTokens: 1000,
-      focusResultChars: 800,
-      model: 'gliner-decide-1b',
-      goal: 'g',
+      spareThreshold: 0.9,
+      truncateInputChars: 200,
+      cheapTools: ['mcp__db__query', 'Foo'],
+      expensiveTools: ['Bar'],
+      model: 'gliner25-multi',
       compactAtPercent: 60,
       minReductionRatio: 0.25,
     });
-    expect(resolveHookConfig({ serverUrl: '' }).serverUrl).toBe('http://127.0.0.1:8765');
+    expect(resolveHookConfig({ serverUrl: '', cheapTools: ' , ' })).toMatchObject({
+      serverUrl: 'http://127.0.0.1:8765',
+    });
+    expect(resolveHookConfig({ cheapTools: ' , ' }).cheapTools).toBeUndefined();
   });
 });
 
@@ -95,40 +92,19 @@ describe('session message mapping', () => {
   it('returns the engine objects for untouched messages and handle-less copies for rebuilt ones', () => {
     const messages = transcript();
     const calls = collectToolCalls(messages, 0);
-    const decisions = [
-      decideCall(calls[0]!, { keepCall: 0.9, keepResult: 0.1 }, { keepThreshold: 0.5 }),
-      decideCall(calls[1]!, { keepCall: 0.9, keepResult: 0.9 }, { keepThreshold: 0.5 }),
+    const decisions: CallDecision[] = [
+      { id: 't1', tool: 'Read', action: 'drop_result', reason: 'cheap', cost: 'cheap' },
+      { id: 't2', tool: 'Bash', action: 'keep', reason: 'model_spared', cost: 'unknown', pExpensive: 0.9 },
     ];
-    messages[1]!.toolUses[0]!.text = 'x'.repeat(2000);
-    messages[2]!.toolResults![0]!.text = 'x'.repeat(2000);
     const out = toSessionMessages(messages, applyDecisions(messages, decisions, calls, 300));
     expect(out).toHaveLength(messages.length);
     expect(out[0]).toBe(messages[0]);
     expect(out[1]?.handle).toBeUndefined();
-    expect(out[1]?.toolUses[0]?.text).toMatch(
-      new RegExp(`^${'x'.repeat(300)}\\n\\[fast-gliner-compaction truncated 1700 chars`),
-    );
+    expect(out[1]?.toolUses[0]?.text).toMatch(/\n\[fast-gliner-compaction truncated \d+ chars of this tool result/);
     expect(out[2]?.handle).toBeUndefined();
-    expect(out[2]?.toolResults?.[0]?.text).toMatch(
-      new RegExp(`^${'x'.repeat(300)}\\n\\[fast-gliner-compaction truncated 1700 chars`),
-    );
     expect(out[2]?.toolResults?.[0]).toMatchObject({ tool_use_id: 'tool-1', isError: false });
     expect(out[3]).toBe(messages[3]);
     expect(out[4]).toBe(messages[4]);
-  });
-
-  it('preserves short dropped-result messages and their handles', () => {
-    const messages = transcript();
-    messages[1]!.toolUses[0]!.text = 'y'.repeat(100);
-    messages[2]!.toolResults![0]!.text = 'y'.repeat(100);
-    const calls = collectToolCalls(messages, 0);
-    const decisions = [
-      decideCall(calls[0]!, { keepCall: 0.9, keepResult: 0.1 }, { keepThreshold: 0.5 }),
-      decideCall(calls[1]!, { keepCall: 0.9, keepResult: 0.9 }, { keepThreshold: 0.5 }),
-    ];
-    const out = toSessionMessages(messages, applyDecisions(messages, decisions, calls, 300));
-    expect(out[1]).toBe(messages[1]);
-    expect(out[2]).toBe(messages[2]);
   });
 });
 
@@ -136,41 +112,43 @@ describe('compactSession', () => {
   it('runs the library over the engine fetch and reports the outcome', async () => {
     const calls: { url: string; body: string }[] = [];
     const config = {
-      ...resolveHookConfig({ preserveRecentMessages: 1, serverUrl: 'http://gpu:8765', model: 'gliner-decide-1b' }),
+      ...resolveHookConfig({ preserveRecentMessages: 2, serverUrl: 'http://gpu:8765' }),
       serverToken: 't',
     };
-    const { result: output, messages } = await compactSession(transcript(), config, serverFetch(keepT2, calls));
+    const { result: output, messages } = await compactSession(transcript(), config, serverFetch(0.95, calls));
     expect(calls).toHaveLength(1);
     expect(calls[0]!.url).toBe('http://gpu:8765/v1/decide');
     expect(JSON.parse(calls[0]!.body)).toMatchObject({ model: 'gliner-decide-1b' });
-    expect(output.decisions.map((d) => d.action)).toEqual(['drop_call', 'keep']);
-    expect(messages.map((m) => m.handle)).toEqual(['h-0', 'h-tool-2', 'r-tool-2', 'h-5', 'h-6']);
+    expect(output.decisions.map((d) => d.reason)).toEqual(['cheap', 'model_spared']);
+    expect(messages.map((m) => m.handle)).toEqual(['h-0', undefined, undefined, 'h-tool-2', 'r-tool-2', 'h-5', 'h-6']);
     expect(summarize(output)).toMatch(
-      /^\d+% reduction; 1 kept, 1 call_dropped; outline ~\d+ tokens \(full\), 1 request\(s\), model 5ms$/,
+      /^\d+% reduction; 1 results truncated, 1 spared as expensive; 1 by rule, 1 by model in 5ms$/,
     );
-    expect(decisionLog(output)).toBe('t1:Read:drop_call/call=0.10/result=0.10 t2:Bash:keep/call=0.90/result=0.90');
+    expect(decisionLog(output)).toBe('t1:Read:drop_result/cheap t2:Bash:keep/model_spared=0.95');
     expect(decisionLogLines(output)).toEqual([`decisions: ${decisionLog(output)}`]);
   });
 
   it('splits a long decision log into ui.log lines under the host limit', async () => {
-    const config = resolveHookConfig({ preserveRecentMessages: 1 });
-    const { result: output } = await compactSession(transcript(), config, serverFetch(() => 0.1));
+    const config = resolveHookConfig({ preserveRecentMessages: 2 });
+    const { result: output } = await compactSession(transcript(), config, serverFetch(0.1));
     const lines = decisionLogLines(output, 60);
     expect(lines).toEqual([
-      'decisions (1/2): t1:Read:drop_call/call=0.10/result=0.10',
-      'decisions (2/2): t2:Bash:drop_call/call=0.10/result=0.10',
+      'decisions (1/2): t1:Read:drop_result/cheap',
+      'decisions (2/2): t2:Bash:drop_result/model_dropped=0.10',
     ]);
     expect(lines.every((line) => line.length <= 60)).toBe(true);
     expect(decisionLogLines({ ...output, decisions: [] })).toEqual(['decisions: (none)']);
   });
 
-  it('throws on failed requests and bad answers so the hook falls back', async () => {
-    const config = resolveHookConfig({ preserveRecentMessages: 1 });
-    await expect(
-      compactSession(transcript(), config, async () => ({ status: 401, ok: false, text: 'invalid token' })),
-    ).rejects.toThrow(/401/);
-    await expect(
-      compactSession(transcript(), config, async () => ({ status: 200, ok: true, text: '{"answers":[]}' })),
-    ).rejects.toThrow(/answered 0 of 2/);
+  it('still compacts by rule when the server fails, keeping what it could not classify', async () => {
+    const config = resolveHookConfig({ preserveRecentMessages: 2 });
+    const { result: output } = await compactSession(transcript(), config, async () => ({
+      status: 401,
+      ok: false,
+      text: 'invalid token',
+    }));
+    expect(output.decisions.map((d) => d.reason)).toEqual(['cheap', 'model_unavailable']);
+    expect(output.stats.modelError).toMatch(/401/);
+    expect(summarize(output)).toMatch(/model unavailable, 1 unclassified kept \(decision server request failed \(401\)/);
   });
 });

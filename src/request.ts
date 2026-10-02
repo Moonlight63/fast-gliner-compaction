@@ -1,7 +1,7 @@
 import type { DecideResponse, DecisionQuestions } from './types.js';
 
 export const DEFAULT_SERVER_URL = 'http://127.0.0.1:8765';
-export const DEFAULT_MODEL = 'gliner-decide';
+export const DEFAULT_MODEL = 'gliner-decide-1b';
 
 export interface DecideRequest {
   url: string;

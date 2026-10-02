@@ -7,8 +7,8 @@
     {
       "name": "fast-gliner-compaction",
       "source": "./",
-      "description": "Verbatim compaction for Claude Code sessions, scored by a self-hosted GLiNER2.5 decision model.",
-      "version": "0.1.0",
+      "description": "Removal-first compaction for Claude Code sessions: old tool output is truncated unless it is expensive to get again.",
+      "version": "0.2.0",
       "license": "MIT"
     }
   ]

@@ -1,15 +1,15 @@
 """HTTP decision server for fast-gliner-compaction.
 
     POST /v1/decide
-      {"model": "gliner-decide",
-       "questions": {"keep_call": "...", "keep_result": "..."},
+      {"model": "gliner-decide-1b",
+       "questions": {"expensive": "..."},
        "items": ["state text 1", "state text 2", ...]}
-    -> {"model": "...", "answers": [{"keep_call": 0.93, "keep_result": 0.12}, ...], "ms": 41}
+    -> {"model": "...", "answers": [{"expensive": 0.91}, ...], "ms": 41}
 
     GET /health -> loaded models, devices, known models
 
 Environment:
-    FGC_MODELS      models to load at startup (comma list, default gliner-decide)
+    FGC_MODELS      models to load at startup (comma list, default gliner-decide-1b)
     FGC_LAZY        load other known models on first request (default 1)
     FGC_DEVICE      cuda, cuda:1, cpu (default: cuda when available)
     FGC_HALF        fp16 weights on CUDA (default 1)
@@ -80,7 +80,7 @@ def require_token(authorization: str = Header(default="")) -> None:
 
 
 class DecideRequest(BaseModel):
-    model: str = "gliner-decide"
+    model: str = "gliner-decide-1b"
     questions: Dict[str, str] = Field(min_length=1)
     items: List[str]
 
@@ -90,7 +90,7 @@ app = FastAPI(title="fast-gliner-compaction server")
 
 @app.on_event("startup")
 def preload() -> None:
-    for name in filter(None, (n.strip() for n in os.environ.get("FGC_MODELS", "gliner-decide").split(","))):
+    for name in filter(None, (n.strip() for n in os.environ.get("FGC_MODELS", "gliner-decide-1b").split(","))):
         loaded[name] = backends.load(name, DEVICE, BATCH_SIZE, HALF)
 
 

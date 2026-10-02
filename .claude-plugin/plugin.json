@@ -1,7 +1,7 @@
 {
   "name": "fast-gliner-compaction",
-  "version": "0.1.0",
-  "description": "Verbatim compaction for Claude Code sessions, scored by a self-hosted GLiNER2.5 decision model.",
+  "version": "0.2.0",
+  "description": "Removal-first compaction for Claude Code sessions: old tool output is truncated unless it is expensive to get again, judged by rules and a self-hosted GLiNER2.5 classifier.",
   "license": "MIT",
   "userConfig": {
     "serverUrl": {
@@ -19,14 +19,26 @@
     "model": {
       "type": "string",
       "title": "Decision model",
-      "description": "gliner-decide (340M, default), gliner-decide-1b, gliner-multi-decide, laya, or laya-multilingual. The server loads it on first use unless FGC_LAZY=0.",
-      "default": "gliner-decide"
+      "description": "Model asked about tool calls the rules cannot classify: gliner-decide-1b (default), gliner-decide, gliner25-base, gliner25-multi, laya, ... The server loads it on first use unless FGC_LAZY=0.",
+      "default": "gliner-decide-1b"
     },
-    "keepThreshold": {
+    "spareThreshold": {
       "type": "number",
-      "title": "Keep threshold",
-      "description": "Minimum model probability that a tool call or tool result is still needed; below it the item is removed.",
-      "default": 0.5
+      "title": "Spare threshold",
+      "description": "Minimum model probability that re-running a call would be expensive for its output to be kept. Higher removes more.",
+      "default": 0.85
+    },
+    "cheapTools": {
+      "type": "string",
+      "title": "Extra cheap tools",
+      "description": "Comma-separated tool-name globs whose output is always cheap to get again (truncated). Wins over the built-in rules.",
+      "default": ""
+    },
+    "expensiveTools": {
+      "type": "string",
+      "title": "Extra expensive tools",
+      "description": "Comma-separated tool-name globs whose output is always kept. Wins over the built-in rules.",
+      "default": ""
     },
     "preserveRecentMessages": {
       "type": "number",
@@ -43,19 +55,25 @@
     "minReductionRatio": {
       "type": "number",
       "title": "Minimum reduction ratio",
-      "description": "Minimum estimated character reduction required to replace history.",
+      "description": "Minimum estimated character reduction required to replace history; below it the built-in summary runs instead.",
       "default": 0.25
     },
-    "maxStateTokens": {
+    "truncateHeadChars": {
       "type": "number",
-      "title": "Outline token budget",
-      "description": "Estimated token budget for the conversation outline included with every decision. Larger reads more history but costs quadratically more model time; lower it on CPU hosts.",
-      "default": 3000
+      "title": "Truncated tool result head",
+      "description": "Characters kept from a removed tool result; 0 keeps only the note.",
+      "default": 300
+    },
+    "truncateInputChars": {
+      "type": "number",
+      "title": "Truncated tool input fields",
+      "description": "Characters kept of each long string input field (e.g. a Write's file content) of a call whose result was removed.",
+      "default": 300
     },
     "focusResultChars": {
       "type": "number",
-      "title": "Focus output characters",
-      "description": "Characters of a tool result shown to the model when deciding about that call.",
+      "title": "Output shown to the model",
+      "description": "Characters of a tool result shown to the model when judging re-run cost.",
       "default": 1500
     },
     "maxRequestItems": {
@@ -63,12 +81,6 @@
       "title": "Decisions per request",
       "description": "Tool calls scored per server request.",
       "default": 128
-    },
-    "truncateHeadChars": {
-      "type": "number",
-      "title": "Truncated tool result head",
-      "description": "Characters of a tool result kept when the model decides its full output is no longer needed; 0 keeps only the note.",
-      "default": 300
     }
   }
 }
