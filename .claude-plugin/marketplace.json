@@ -1,15 +1,14 @@
 {
-  "name": "fast-jev-compaction",
+  "name": "fast-gliner-compaction",
   "owner": {
-    "name": "tamaratran",
-    "url": "https://github.com/tamaratran"
+    "name": "Dalen Catt"
   },
   "plugins": [
     {
-      "name": "fast-jev-compaction",
+      "name": "fast-gliner-compaction",
       "source": "./",
-      "description": "Verbatim Jev-guided compaction for Claude Code sessions.",
-      "version": "0.3.0",
+      "description": "Verbatim compaction for Claude Code sessions, scored by a self-hosted GLiNER2.5 decision model.",
+      "version": "0.1.0",
       "license": "MIT"
     }
   ]

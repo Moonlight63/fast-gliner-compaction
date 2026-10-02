@@ -1,0 +1,27 @@
+# docker compose up -d   (on the GPU host)
+#
+# Binds to the host's loopback by default; reach it with an SSH tunnel
+# (ssh -N -L 8765:127.0.0.1:8765 gpu-host) or set FGC_BIND=0.0.0.0 together
+# with FGC_TOKEN to expose it on the LAN.
+services:
+  decision-server:
+    build: .
+    image: fast-gliner-compaction-server
+    restart: unless-stopped
+    ports:
+      - "${FGC_BIND:-127.0.0.1}:${FGC_PORT:-8765}:8765"
+    environment:
+      FGC_MODELS: ${FGC_MODELS:-gliner-decide,gliner-decide-1b}
+      FGC_TOKEN: ${FGC_TOKEN:-}
+      FGC_HALF: ${FGC_HALF:-1}
+      FGC_BATCH_SIZE: ${FGC_BATCH_SIZE:-16}
+    volumes:
+      # Reuse the host's Hugging Face cache so weights are not downloaded twice.
+      - ${HF_CACHE:-~/.cache/huggingface}:/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${FGC_GPU:-0}"]
+              capabilities: [gpu]

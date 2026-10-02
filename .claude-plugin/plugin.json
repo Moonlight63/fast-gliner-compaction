@@ -1,19 +1,31 @@
 {
-  "name": "fast-jev-compaction",
-  "version": "0.3.0",
-  "description": "Verbatim Jev-guided compaction for Claude Code sessions.",
+  "name": "fast-gliner-compaction",
+  "version": "0.1.0",
+  "description": "Verbatim compaction for Claude Code sessions, scored by a self-hosted GLiNER2.5 decision model.",
   "license": "MIT",
   "userConfig": {
-    "apiKey": {
+    "serverUrl": {
       "type": "string",
-      "title": "TypeSafe API key",
-      "description": "TypeSafe API key. Leave unset to use TYPESAFE_API_KEY.",
+      "title": "Decision server URL",
+      "description": "Base URL of the fast-gliner-compaction server (local or a GPU host). Leave unset to use FGC_SERVER_URL, then http://127.0.0.1:8765.",
+      "default": ""
+    },
+    "serverToken": {
+      "type": "string",
+      "title": "Decision server token",
+      "description": "Bearer token matching the server's FGC_TOKEN. Leave unset to use FGC_TOKEN from the environment.",
       "sensitive": true
+    },
+    "model": {
+      "type": "string",
+      "title": "Decision model",
+      "description": "gliner-decide (340M, default), gliner-decide-1b, gliner-multi-decide, laya, or laya-multilingual. The server loads it on first use unless FGC_LAZY=0.",
+      "default": "gliner-decide"
     },
     "keepThreshold": {
       "type": "number",
       "title": "Keep threshold",
-      "description": "Minimum Jev probability that a tool call or tool result is still needed; below it the item is removed.",
+      "description": "Minimum model probability that a tool call or tool result is still needed; below it the item is removed.",
       "default": 0.5
     },
     "preserveRecentMessages": {
@@ -36,27 +48,27 @@
     },
     "maxStateTokens": {
       "type": "number",
-      "title": "Maximum Jev state tokens",
-      "description": "Estimated token budget for the conversation state sent with every Jev request.",
-      "default": 25000
+      "title": "Outline token budget",
+      "description": "Estimated token budget for the conversation outline included with every decision. Larger reads more history but costs quadratically more model time; lower it on CPU hosts.",
+      "default": 3000
     },
-    "maxRequestTokens": {
+    "focusResultChars": {
       "type": "number",
-      "title": "Maximum Jev request tokens",
-      "description": "Estimated token budget for state plus questions in one Jev request.",
-      "default": 30000
+      "title": "Focus output characters",
+      "description": "Characters of a tool result shown to the model when deciding about that call.",
+      "default": 1500
+    },
+    "maxRequestItems": {
+      "type": "number",
+      "title": "Decisions per request",
+      "description": "Tool calls scored per server request.",
+      "default": 128
     },
     "truncateHeadChars": {
       "type": "number",
       "title": "Truncated tool result head",
-      "description": "Characters of a tool result kept when Jev decides its full output is no longer needed; 0 keeps only the note.",
+      "description": "Characters of a tool result kept when the model decides its full output is no longer needed; 0 keeps only the note.",
       "default": 300
-    },
-    "model": {
-      "type": "string",
-      "title": "Jev model",
-      "description": "TypeSafe Jev model name.",
-      "default": "jev-latest"
     }
   }
 }

@@ -2,3 +2,8 @@ node_modules
 dist
 .env
 demo/JevDemo/build
+
+eval-results.json
+eval-run.log
+server/.venv/
+__pycache__/

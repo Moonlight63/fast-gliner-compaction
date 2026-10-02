@@ -6,7 +6,7 @@ import {
   resolveHookConfig,
   summarize,
   toSessionMessages,
-} from '../hooks/fast-jev.ts';
+} from '../hooks/fast-gliner.ts';
 import { applyDecisions, collectToolCalls, decideCall, type Message } from '../src/index.js';
 
 type SessionMessage = Message & { handle?: string };
@@ -40,31 +40,54 @@ function transcript(): SessionMessage[] {
   ];
 }
 
-function jevFetch(answer: (name: string) => number, bodies: string[] = []) {
-  return async (_url: string, init?: { body?: string }) => {
-    bodies.push(init?.body ?? '');
-    const { questions } = JSON.parse(init?.body ?? '{}') as { questions: Record<string, unknown> };
-    const answers = Object.fromEntries(
-      Object.keys(questions).map((key) => [key, { type: 'noul', noul: answer(key) }]),
+/** A fake decision server: `answer(question, item)` gives P(yes). */
+function serverFetch(answer: (question: string, item: string) => number, calls: { url: string; body: string }[] = []) {
+  return async (url: string, init?: { body?: string }) => {
+    calls.push({ url, body: init?.body ?? '' });
+    const { questions, items } = JSON.parse(init?.body ?? '{}') as {
+      questions: Record<string, string>;
+      items: string[];
+    };
+    const answers = items.map((item) =>
+      Object.fromEntries(Object.keys(questions).map((key) => [key, answer(key, item)])),
     );
-    return { status: 200, ok: true, text: JSON.stringify({ answers }) };
+    return { status: 200, ok: true, text: JSON.stringify({ answers, ms: 5 }) };
   };
 }
 
+const keepT2 = (_question: string, item: string) => (item.startsWith('[focus] tool call t2 ') ? 0.9 : 0.1);
+
 describe('hook config', () => {
   it('reads userConfig values and falls back to defaults', () => {
-    expect(resolveHookConfig({})).toEqual({ compactAtPercent: 60, minReductionRatio: 0.25, model: 'jev-latest' });
+    expect(resolveHookConfig({})).toEqual({
+      compactAtPercent: 60,
+      minReductionRatio: 0.25,
+      model: 'gliner-decide',
+      serverUrl: 'http://127.0.0.1:8765',
+    });
     expect(
-      resolveHookConfig({ apiKey: 'k', keepThreshold: 0.3, maxStateTokens: 1000, model: 'jev-x', goal: 'g', compactAtPercent: 'no' }),
+      resolveHookConfig({
+        serverUrl: 'http://172.16.16.125:8765',
+        serverToken: 't',
+        keepThreshold: 0.3,
+        maxStateTokens: 1000,
+        focusResultChars: 800,
+        model: 'gliner-decide-1b',
+        goal: 'g',
+        compactAtPercent: 'no',
+      }),
     ).toEqual({
-      apiKey: 'k',
+      serverUrl: 'http://172.16.16.125:8765',
+      serverToken: 't',
       keepThreshold: 0.3,
       maxStateTokens: 1000,
-      model: 'jev-x',
+      focusResultChars: 800,
+      model: 'gliner-decide-1b',
       goal: 'g',
       compactAtPercent: 60,
       minReductionRatio: 0.25,
     });
+    expect(resolveHookConfig({ serverUrl: '' }).serverUrl).toBe('http://127.0.0.1:8765');
   });
 });
 
@@ -83,11 +106,11 @@ describe('session message mapping', () => {
     expect(out[0]).toBe(messages[0]);
     expect(out[1]?.handle).toBeUndefined();
     expect(out[1]?.toolUses[0]?.text).toMatch(
-      new RegExp(`^${'x'.repeat(300)}\\n\\[fast-jev-compaction truncated 1700 chars`),
+      new RegExp(`^${'x'.repeat(300)}\\n\\[fast-gliner-compaction truncated 1700 chars`),
     );
     expect(out[2]?.handle).toBeUndefined();
     expect(out[2]?.toolResults?.[0]?.text).toMatch(
-      new RegExp(`^${'x'.repeat(300)}\\n\\[fast-jev-compaction truncated 1700 chars`),
+      new RegExp(`^${'x'.repeat(300)}\\n\\[fast-gliner-compaction truncated 1700 chars`),
     );
     expect(out[2]?.toolResults?.[0]).toMatchObject({ tool_use_id: 'tool-1', isError: false });
     expect(out[3]).toBe(messages[3]);
@@ -111,25 +134,27 @@ describe('session message mapping', () => {
 
 describe('compactSession', () => {
   it('runs the library over the engine fetch and reports the outcome', async () => {
-    const bodies: string[] = [];
-    const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), apiKey: 'k', model: 'jev-x' };
-    const { result: output, messages } = await compactSession(
-      transcript(),
-      config,
-      jevFetch((name) => (name === 'call_t2' || name === 'result_t2' ? 0.9 : 0.1), bodies),
-    );
-    expect(bodies).toHaveLength(1);
-    expect(JSON.parse(bodies[0]!).model).toBe('jev-x');
+    const calls: { url: string; body: string }[] = [];
+    const config = {
+      ...resolveHookConfig({ preserveRecentMessages: 1, serverUrl: 'http://gpu:8765', model: 'gliner-decide-1b' }),
+      serverToken: 't',
+    };
+    const { result: output, messages } = await compactSession(transcript(), config, serverFetch(keepT2, calls));
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.url).toBe('http://gpu:8765/v1/decide');
+    expect(JSON.parse(calls[0]!.body)).toMatchObject({ model: 'gliner-decide-1b' });
     expect(output.decisions.map((d) => d.action)).toEqual(['drop_call', 'keep']);
     expect(messages.map((m) => m.handle)).toEqual(['h-0', 'h-tool-2', 'r-tool-2', 'h-5', 'h-6']);
-    expect(summarize(output)).toMatch(/^\d+% reduction; 1 kept, 1 call_dropped; state ~\d+ tokens \(full\) in 1 request\(s\)$/);
+    expect(summarize(output)).toMatch(
+      /^\d+% reduction; 1 kept, 1 call_dropped; outline ~\d+ tokens \(full\), 1 request\(s\), model 5ms$/,
+    );
     expect(decisionLog(output)).toBe('t1:Read:drop_call/call=0.10/result=0.10 t2:Bash:keep/call=0.90/result=0.90');
     expect(decisionLogLines(output)).toEqual([`decisions: ${decisionLog(output)}`]);
   });
 
   it('splits a long decision log into ui.log lines under the host limit', async () => {
-    const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), apiKey: 'k' };
-    const { result: output } = await compactSession(transcript(), config, jevFetch(() => 0.1));
+    const config = resolveHookConfig({ preserveRecentMessages: 1 });
+    const { result: output } = await compactSession(transcript(), config, serverFetch(() => 0.1));
     const lines = decisionLogLines(output, 60);
     expect(lines).toEqual([
       'decisions (1/2): t1:Read:drop_call/call=0.10/result=0.10',
@@ -139,11 +164,13 @@ describe('compactSession', () => {
     expect(decisionLogLines({ ...output, decisions: [] })).toEqual(['decisions: (none)']);
   });
 
-  it('throws on a missing key and on failed requests so the hook falls back', async () => {
+  it('throws on failed requests and bad answers so the hook falls back', async () => {
     const config = resolveHookConfig({ preserveRecentMessages: 1 });
-    await expect(compactSession(transcript(), config, jevFetch(() => 0))).rejects.toThrow(/TYPESAFE_API_KEY/);
     await expect(
-      compactSession(transcript(), { ...config, apiKey: 'k' }, async () => ({ status: 500, ok: false, text: 'x' })),
-    ).rejects.toThrow(/500/);
+      compactSession(transcript(), config, async () => ({ status: 401, ok: false, text: 'invalid token' })),
+    ).rejects.toThrow(/401/);
+    await expect(
+      compactSession(transcript(), config, async () => ({ status: 200, ok: true, text: '{"answers":[]}' })),
+    ).rejects.toThrow(/answered 0 of 2/);
   });
 });

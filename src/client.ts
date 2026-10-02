@@ -1,36 +1,35 @@
-import { buildJevRequest, parseJevResponse } from './request.js';
-import type { JevAsker, JevQuestions, JevResponse, JevState } from './types.js';
+import { buildDecideRequest, parseDecideResponse } from './request.js';
+import type { DecideResponse, DecisionQuestions, Decider } from './types.js';
 
-export interface JevClientOptions {
-  /** Defaults to `process.env.TYPESAFE_API_KEY`. */
-  apiKey?: string;
-  /** Defaults to `jev-latest`. */
+export interface GlinerClientOptions {
+  /** Defaults to `process.env.FGC_SERVER_URL`, then `http://127.0.0.1:8765`. */
+  serverUrl?: string;
+  /** Bearer token; defaults to `process.env.FGC_TOKEN`. */
+  token?: string;
+  /** Server model name; defaults to `gliner-decide`. */
   model?: string;
-  /** Defaults to the System One endpoint. */
-  baseUrl?: string;
   /** Defaults to the global `fetch`. */
   fetch?: typeof fetch;
 }
 
-/** Asks Jev over HTTP with the global `fetch` (or an injected one). */
-export class JevClient implements JevAsker {
-  private readonly apiKey: string;
+/** Asks the decision server over HTTP with the global `fetch` (or an injected one). */
+export class GlinerClient implements Decider {
+  private readonly serverUrl: string | undefined;
+  private readonly token: string | undefined;
   private readonly model: string | undefined;
-  private readonly baseUrl: string | undefined;
   private readonly fetcher: typeof fetch;
 
-  constructor(options: JevClientOptions = {}) {
-    this.apiKey = options.apiKey ?? process.env.TYPESAFE_API_KEY ?? '';
+  constructor(options: GlinerClientOptions = {}) {
+    this.serverUrl = options.serverUrl ?? process.env.FGC_SERVER_URL;
+    this.token = options.token ?? process.env.FGC_TOKEN;
     this.model = options.model;
-    this.baseUrl = options.baseUrl;
     this.fetcher = options.fetch ?? fetch;
   }
 
-  async ask(state: JevState, questions: JevQuestions): Promise<JevResponse> {
-    if (!this.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
-    const request = buildJevRequest(
-      { apiKey: this.apiKey, model: this.model, baseUrl: this.baseUrl },
-      state,
+  async decide(items: readonly string[], questions: DecisionQuestions): Promise<DecideResponse> {
+    const request = buildDecideRequest(
+      { serverUrl: this.serverUrl, token: this.token, model: this.model },
+      items,
       questions,
     );
     const response = await this.fetcher(request.url, {
@@ -38,6 +37,12 @@ export class JevClient implements JevAsker {
       headers: request.headers,
       body: request.body,
     });
-    return parseJevResponse(response.status, response.ok, await response.text());
+    return parseDecideResponse(
+      response.status,
+      response.ok,
+      await response.text(),
+      items.length,
+      questions,
+    );
   }
 }

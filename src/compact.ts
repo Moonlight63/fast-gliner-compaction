@@ -1,13 +1,11 @@
-import { noulAnswer } from './request.js';
-import { collectToolCalls, estimateTokens, fitState } from './state.js';
+import { collectToolCalls, fitState, focusText, renderState, resultText } from './state.js';
 import type {
   CallAnswer,
   CallDecision,
   CompactOptions,
   CompactResult,
-  CompactionState,
-  JevAsker,
-  JevQuestions,
+  Decider,
+  DecisionQuestions,
   Message,
   ResolvedCompactOptions,
   ToolCall,
@@ -18,13 +16,23 @@ export const DEFAULT_OPTIONS: ResolvedCompactOptions = {
   goal: '',
   keepThreshold: 0.5,
   preserveRecentMessages: 6,
-  maxStateTokens: 25_000,
-  maxRequestTokens: 30_000,
+  maxStateTokens: 3_000,
+  focusResultChars: 1_500,
+  maxRequestItems: 128,
   truncateHeadChars: 300,
 };
 
-/** Tokens the request envelope (`model`, key names) adds around state and questions. */
-const REQUEST_OVERHEAD_TOKENS = 20;
+/**
+ * The two yes/no questions asked of every item. They name "the focused tool
+ * call" rather than an id so that every item shares one question set, which
+ * lets the server batch all items through one forward pass.
+ */
+export const QUESTIONS = {
+  keep_call:
+    'Should the focused tool call stay in the history, because knowing that this call was made, with its input, still matters for what the assistant does next?',
+  keep_result:
+    'Does the assistant still need the full output of the focused tool call verbatim, so that re-running the tool would not do?',
+} as const satisfies DecisionQuestions;
 
 function finite(value: number | undefined, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
@@ -41,9 +49,13 @@ export function resolveOptions(options: CompactOptions = {}): ResolvedCompactOpt
       ),
     ),
     maxStateTokens: Math.max(1, finite(options.maxStateTokens, DEFAULT_OPTIONS.maxStateTokens)),
-    maxRequestTokens: Math.max(
+    focusResultChars: Math.max(
+      0,
+      Math.floor(finite(options.focusResultChars, DEFAULT_OPTIONS.focusResultChars)),
+    ),
+    maxRequestItems: Math.max(
       1,
-      finite(options.maxRequestTokens, DEFAULT_OPTIONS.maxRequestTokens),
+      Math.floor(finite(options.maxRequestItems, DEFAULT_OPTIONS.maxRequestItems)),
     ),
     truncateHeadChars: Math.max(
       0,
@@ -52,49 +64,31 @@ export function resolveOptions(options: CompactOptions = {}): ResolvedCompactOpt
   };
 }
 
-/** The two `noul` questions asked about one call: keep the call, keep its result. */
-export function questionsFor(call: ToolCall): JevQuestions {
-  return {
-    [`call_${call.id}`]: {
-      type: 'noul',
-      instructions: `Tool call ${call.id} (${call.tool}) should stay in the history: knowing this call was made, with its input, still matters for what the assistant does next`,
-    },
-    [`result_${call.id}`]: {
-      type: 'noul',
-      instructions: `The full output of tool call ${call.id} (${call.tool}, ${call.resultChars} chars) should stay in the history verbatim: the assistant still needs its contents and re-running the tool would not do`,
-    },
-  };
+/**
+ * One decision item per candidate call: its focus block first (so a model
+ * that truncates loses outline, never the call), then the shared outline.
+ */
+export function decisionItems(
+  messages: readonly Message[],
+  candidates: readonly ToolCall[],
+  outline: string,
+  options: Pick<ResolvedCompactOptions, 'focusResultChars'>,
+): string[] {
+  return candidates.map(
+    (call) =>
+      `${focusText(call, resultText(messages, call), options.focusResultChars)}\n\n${outline}`,
+  );
 }
 
-/**
- * Splits the candidate calls into batches whose questions, together with the
- * (always complete) state, fit one request.
- */
+/** Splits the candidate calls into requests of at most `maxRequestItems` items. */
 export function batchCalls(
   calls: readonly ToolCall[],
-  stateTokens: number,
-  options: Pick<ResolvedCompactOptions, 'maxRequestTokens'>,
+  options: Pick<ResolvedCompactOptions, 'maxRequestItems'>,
 ): ToolCall[][] {
-  const budget = options.maxRequestTokens - stateTokens - REQUEST_OVERHEAD_TOKENS;
   const batches: ToolCall[][] = [];
-  let current: ToolCall[] = [];
-  let currentTokens = 0;
-  for (const call of calls) {
-    const tokens = estimateTokens(JSON.stringify(questionsFor(call)));
-    if (current.length > 0 && currentTokens + tokens > budget) {
-      batches.push(current);
-      current = [];
-      currentTokens = 0;
-    }
-    if (current.length === 0 && tokens > budget) {
-      throw new Error(
-        `state leaves no room for questions (~${stateTokens} of ${options.maxRequestTokens} tokens)`,
-      );
-    }
-    current.push(call);
-    currentTokens += tokens;
+  for (let i = 0; i < calls.length; i += options.maxRequestItems) {
+    batches.push(calls.slice(i, i + options.maxRequestItems));
   }
-  if (current.length > 0) batches.push(current);
   return batches;
 }
 
@@ -115,27 +109,32 @@ export function decideCall(
 }
 
 async function askBatch(
-  asker: JevAsker,
-  state: CompactionState,
+  decider: Decider,
+  messages: readonly Message[],
   batch: readonly ToolCall[],
-): Promise<Map<string, CallAnswer>> {
-  const questions: JevQuestions = Object.assign({}, ...batch.map(questionsFor));
-  const { answers } = await asker.ask(state, questions);
-  return new Map(
-    batch.map((call) => [
-      call.id,
-      {
-        keepCall: noulAnswer(answers, `call_${call.id}`),
-        keepResult: noulAnswer(answers, `result_${call.id}`),
-      },
-    ]),
-  );
+  outline: string,
+  options: Pick<ResolvedCompactOptions, 'focusResultChars'>,
+): Promise<{ answers: Map<string, CallAnswer>; ms: number }> {
+  const items = decisionItems(messages, batch, outline, options);
+  const response = await decider.decide(items, QUESTIONS);
+  if (response.answers.length !== batch.length) {
+    throw new Error(`decider answered ${response.answers.length} of ${batch.length} items`);
+  }
+  return {
+    answers: new Map(
+      batch.map((call, index) => {
+        const row = response.answers[index]!;
+        return [call.id, { keepCall: row.keep_call!, keepResult: row.keep_result! }];
+      }),
+    ),
+    ms: response.ms ?? 0,
+  };
 }
 
 function truncatedResultText(text: string, isError: boolean, headChars: number): string {
   if (text.length <= headChars + 120) return text;
   const head = headChars > 0 ? `${text.slice(0, headChars)}\n` : '';
-  return `${head}[fast-jev-compaction truncated ${text.length - headChars} chars of this tool result${
+  return `${head}[fast-gliner-compaction truncated ${text.length - headChars} chars of this tool result${
     isError ? ' (error)' : ''
   }; re-run the tool if needed]`;
 }
@@ -248,15 +247,16 @@ function count(decisions: readonly CallDecision[], reason: CallDecision['reason'
 }
 
 /**
- * Compacts a transcript by asking Jev, for every tool call outside the pinned
- * first and newest messages, whether the call and whether its result must
- * stay. The whole history (results omitted, fitted into `maxStateTokens`) is
- * sent as state with every batch of questions. Throws when Jev fails or the
- * history cannot be fitted; the caller decides whether to fall back.
+ * Compacts a transcript by asking the decider, for every tool call outside
+ * the pinned first and newest messages, whether the call and whether its
+ * result must stay. Each call becomes one item: its focus block plus the
+ * shared outline of the whole history (results omitted, fitted into
+ * `maxStateTokens`). Throws when the decider fails or the history cannot be
+ * fitted; the caller decides whether to fall back.
  */
 export async function compact(
   messages: readonly Message[],
-  asker: JevAsker,
+  decider: Decider,
   options: CompactOptions = {},
 ): Promise<CompactResult> {
   const started = Date.now();
@@ -267,15 +267,19 @@ export async function compact(
 
   let fitted: { tokens: number; stage: string } = { tokens: 0, stage: '' };
   let batches: ToolCall[][] = [];
+  let modelMs = 0;
   const answers = new Map<string, CallAnswer>();
   if (candidates.length > 0) {
     const state = fitState(messages, calls, resolved);
     fitted = state;
-    batches = batchCalls(candidates, state.tokens, resolved);
-    const answered = await Promise.all(
-      batches.map((batch) => askBatch(asker, state.state, batch)),
-    );
-    for (const map of answered) for (const [id, answer] of map) answers.set(id, answer);
+    const outline = renderState(state.state);
+    batches = batchCalls(candidates, resolved);
+    // Sequential: one server serialises a model anyway, and this keeps request sizes bounded.
+    for (const batch of batches) {
+      const answered = await askBatch(decider, messages, batch, outline, resolved);
+      modelMs += answered.ms;
+      for (const [id, answer] of answered.answers) answers.set(id, answer);
+    }
   }
 
   const decisions = calls.map((call) =>
@@ -303,6 +307,7 @@ export async function compact(
       stateTokens: fitted.tokens,
       stateStage: fitted.stage,
       requests: batches.length,
+      modelMs,
       ms: Date.now() - started,
     },
   };

@@ -1,80 +1,78 @@
-import type { JevAnswer, JevQuestions, JevResponse, JevState } from './types.js';
+import type { DecideResponse, DecisionQuestions } from './types.js';
 
-export const SYSTEM_ONE_URL = 'https://api.typesafe.ai/v1/systemone';
-export const DEFAULT_MODEL = 'jev-latest';
+export const DEFAULT_SERVER_URL = 'http://127.0.0.1:8765';
+export const DEFAULT_MODEL = 'gliner-decide';
 
-export interface JevRequest {
+export interface DecideRequest {
   url: string;
   method: 'POST';
   headers: Record<string, string>;
   body: string;
 }
 
-/** The HTTP request for one Jev call, for any fetch-like transport. */
-export function buildJevRequest(
+/** The HTTP request for one decision batch, for any fetch-like transport. */
+export function buildDecideRequest(
   params: {
-    apiKey: string;
+    serverUrl?: string;
+    token?: string;
     model?: string;
-    baseUrl?: string;
   },
-  state: JevState,
-  questions: JevQuestions,
-): JevRequest {
+  items: readonly string[],
+  questions: DecisionQuestions,
+): DecideRequest {
+  const headers: Record<string, string> = { 'content-type': 'application/json' };
+  if (params.token) headers.authorization = `Bearer ${params.token}`;
   return {
-    url: params.baseUrl ?? SYSTEM_ONE_URL,
+    url: `${(params.serverUrl ?? DEFAULT_SERVER_URL).replace(/\/+$/, '')}/v1/decide`,
     method: 'POST',
-    headers: {
-      authorization: `Bearer ${params.apiKey}`,
-      'content-type': 'application/json',
-    },
+    headers,
     body: JSON.stringify({
       model: params.model ?? DEFAULT_MODEL,
-      state,
       questions,
+      items,
     }),
   };
 }
 
-/** Validates a Jev response body; throws on anything but an `answers` object. */
-export function parseJevResponse(
+/**
+ * Validates a decision response: one row per item, a finite probability in
+ * [0, 1] for every question. Throws on anything else.
+ */
+export function parseDecideResponse(
   status: number,
   ok: boolean,
   text: string,
-): JevResponse {
+  itemCount: number,
+  questions: DecisionQuestions,
+): DecideResponse {
   if (!ok) {
-    throw new Error(`Jev request failed (${status}): ${text.slice(0, 200)}`);
+    throw new Error(`decision server request failed (${status}): ${text.slice(0, 200)}`);
   }
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
   } catch {
-    throw new Error('Jev returned malformed JSON');
+    throw new Error('decision server returned malformed JSON');
   }
   if (
     parsed === null ||
     typeof parsed !== 'object' ||
     !('answers' in parsed) ||
-    parsed.answers === null ||
-    typeof parsed.answers !== 'object'
+    !Array.isArray(parsed.answers)
   ) {
-    throw new Error('Jev response is missing answers');
+    throw new Error('decision server response is missing answers');
   }
-  return parsed as JevResponse;
-}
-
-/** The `noul` probability of one answer; throws when it is not there. */
-export function noulAnswer(
-  answers: Record<string, JevAnswer>,
-  name: string,
-): number {
-  const answer = answers[name];
-  if (
-    !answer ||
-    !('noul' in answer) ||
-    typeof answer.noul !== 'number' ||
-    !Number.isFinite(answer.noul)
-  ) {
-    throw new Error(`Invalid Jev answer for ${name}`);
+  const answers = parsed.answers as unknown[];
+  if (answers.length !== itemCount) {
+    throw new Error(`decision server answered ${answers.length} of ${itemCount} items`);
   }
-  return answer.noul;
+  for (const row of answers) {
+    for (const id of Object.keys(questions)) {
+      const value = (row as Record<string, unknown> | null)?.[id];
+      if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 1) {
+        throw new Error(`invalid decision server answer for ${id}`);
+      }
+    }
+  }
+  return parsed as DecideResponse;
 }

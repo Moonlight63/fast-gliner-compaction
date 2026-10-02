@@ -9,7 +9,7 @@ import type {
 } from './types.js';
 
 export const STATE_CONTEXT =
-  'A coding assistant conversation is being compacted to free context. `history` is the whole conversation so far, oldest first; tool outputs are replaced by a short `result` note and long texts may be abridged. Each question asks whether one tool call, or the full output of that call, still needs to stay in the history verbatim. Whatever is not kept is deleted permanently, but the assistant can always re-run a tool or re-read a file.';
+  'A coding assistant conversation is being compacted to free context. The focused tool call is shown first with the start of its output, then the whole conversation so far, oldest first, with tool outputs replaced by a short note. Whatever is not kept is deleted permanently, but the assistant can always re-run a tool or re-read a file.';
 
 /** Successive caps on the serialised tool input included per call. */
 const INPUT_CHARS = [1000, 200, 60] as const;
@@ -20,10 +20,9 @@ const TOKEN_PIECES = /[A-Za-z]+|\d+|[^\sA-Za-z\d]/g;
 
 /**
  * Estimates tokens without a tokenizer: a word costs one token per six
- * letters, a digit half a token, any other symbol nine tenths. Calibrated
- * against the usage Jev reports for real transcripts, where it lands 2–18%
- * above the true count; a plain characters-per-token ratio undercounts the
- * JSON-heavy states by up to 40%.
+ * letters, a digit half a token, any other symbol nine tenths. Upstream
+ * calibrated it 2–18% above Jev's tokenizer on real transcripts; it is used
+ * here only as a budget, and the server truncates at each model's limit.
  */
 export function estimateTokens(text: string): number {
   let tokens = 0;
@@ -170,6 +169,41 @@ function historyEntries(
   return entries;
 }
 
+/** The text of a call's tool result, '' when it cannot be found. */
+export function resultText(messages: readonly Message[], call: ToolCall): string {
+  return (
+    messages[call.resultIndex]?.toolResults?.find(
+      (result) => result.tool_use_id === call.tool_use_id,
+    )?.text ?? ''
+  );
+}
+
+/** The block naming the call being decided: its full-ish input and the head of its output. */
+export function focusText(call: ToolCall, result: string, resultChars: number): string {
+  const head = result.length <= resultChars ? result : `${result.slice(0, resultChars)}\n[… ${result.length - resultChars} more chars]`;
+  return [
+    `[focus] tool call ${call.id} ${call.tool} input=${inputText(call.input, INPUT_CHARS[0])}`,
+    `[focus output] ${call.isError ? 'error' : 'ok'}, ${call.resultChars} chars:`,
+    head,
+  ].join('\n');
+}
+
+/** The outline as plain transcript text, which an encoder reads better than JSON. */
+export function renderState(state: CompactionState): string {
+  const lines = [`[context] ${state.context}`, `[goal] ${state.goal}`];
+  for (const entry of state.history) {
+    if (entry.text) lines.push(`[${entry.role}] ${entry.text}`);
+    for (const call of entry.tool_calls ?? []) {
+      lines.push(
+        typeof call === 'string'
+          ? `  ${call}`
+          : `  ${call.id} ${call.tool} ${call.input} → ${call.result}`,
+      );
+    }
+  }
+  return lines.join('\n');
+}
+
 /** The last three user prompts, as the default `goal`. */
 export function goalFromMessages(messages: readonly Message[]): string {
   return messages
@@ -185,7 +219,7 @@ export function goalFromMessages(messages: readonly Message[]): string {
 }
 
 /**
- * Builds the Jev state from the whole conversation and shrinks it in stages
+ * Builds the outline from the whole conversation and shrinks it in stages
  * until it fits `maxStateTokens`: tool inputs are truncated, then long texts
  * are abridged oldest-first (pinned messages last), then old messages collapse
  * to a one-line note, then old tool calls shrink to one line each, then old
@@ -298,7 +332,47 @@ export function fitState(
   tokens = baseTokens + perEntry.reduce((sum, n) => sum + n, 0);
   if (fits()) return fitted(history, tokens, 'old calls merged');
 
+  // Last resort for long sessions: leave the oldest non-pinned entries out
+  // entirely, behind one note. Each decision item carries its own call in the
+  // focus block, so the outline only has to give recent context.
+  // Merged runs hold many one-line calls, so trim those line by line rather
+  // than dropping a whole run at once.
+  const note = (entries: number, calls: number): HistoryEntry => ({
+    i: 1,
+    role: 'assistant',
+    text: `[… ${calls} older tool calls and ${entries} messages omitted …]`,
+  });
+  const noteTokens = entryTokens(note(99_999, 99_999));
+  const remaining = history.map((entry) => ({ ...entry }));
+  let omittedEntries = 0;
+  let omittedCalls = 0;
+  for (let index = 0; tokens + noteTokens > options.maxStateTokens && index < remaining.length; ) {
+    const entry = remaining[index]!;
+    if (pinned(entry)) {
+      index += 1;
+      continue;
+    }
+    const lines = entry.tool_calls;
+    const before = entryTokens(entry);
+    if (lines && lines.length > 1 && typeof lines[0] === 'string') {
+      entry.tool_calls = (lines as string[]).slice(1);
+      tokens += entryTokens(entry) - before;
+      omittedCalls += 1;
+      continue;
+    }
+    remaining.splice(index, 1);
+    tokens -= before;
+    omittedEntries += 1;
+    omittedCalls += lines?.length ?? 0;
+  }
+  if (omittedCalls + omittedEntries > 0 && tokens + noteTokens <= options.maxStateTokens) {
+    const at = remaining.findIndex((entry) => !pinned(entry) || entry.i > 0);
+    const withNote = [...remaining];
+    withNote.splice(at < 0 ? remaining.length : at, 0, note(omittedEntries, omittedCalls));
+    return fitted(withNote, tokens + entryTokens(note(omittedEntries, omittedCalls)), 'oldest left out');
+  }
+
   throw new Error(
-    `history too large for Jev (~${tokens} tokens after truncation, limit ${options.maxStateTokens})`,
+    `history too large for the outline (~${tokens} tokens after truncation, limit ${options.maxStateTokens})`,
   );
 }

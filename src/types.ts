@@ -32,7 +32,7 @@ export interface Message {
 
 /** A tool call paired with its result by `tool_use_id`. */
 export interface ToolCall {
-  /** Short id used in the Jev state and question names (`t1`, `t2`, ...). */
+  /** Short id used in the outline and focus block (`t1`, `t2`, ...). */
   id: string;
   tool_use_id: string;
   tool: string;
@@ -48,9 +48,9 @@ export interface ToolCall {
 }
 
 export interface CallAnswer {
-  /** Jev's probability that the call itself still matters. */
+  /** The model's probability that the call itself still matters. */
   keepCall: number;
-  /** Jev's probability that the full result still needs to stay verbatim. */
+  /** The model's probability that the full result still needs to stay verbatim. */
   keepResult: number;
 }
 
@@ -78,7 +78,7 @@ export interface HistoryEntry {
   tool_calls?: HistoryToolCall[] | string[];
 }
 
-/** The state sent with every Jev request: the whole history, results omitted. */
+/** The outline shared by every decision item: the whole history, results omitted. */
 export interface CompactionState {
   context: string;
   goal: string;
@@ -99,10 +99,12 @@ export interface CompactOptions {
   keepThreshold?: number;
   /** Newest messages never touched (the first message is always kept). Default 6. */
   preserveRecentMessages?: number;
-  /** Estimated token ceiling for the state. Default 25000. */
+  /** Estimated token ceiling for the shared outline. Default 3000. */
   maxStateTokens?: number;
-  /** Estimated token ceiling for state plus one batch of questions. Default 30000. */
-  maxRequestTokens?: number;
+  /** Characters of a call's result shown in its focus block. Default 1500. */
+  focusResultChars?: number;
+  /** Decision items sent per server request. Default 128. */
+  maxRequestItems?: number;
   /** Characters of a dropped tool result to retain. Default 300. */
   truncateHeadChars?: number;
 }
@@ -112,7 +114,8 @@ export interface ResolvedCompactOptions {
   keepThreshold: number;
   preserveRecentMessages: number;
   maxStateTokens: number;
-  maxRequestTokens: number;
+  focusResultChars: number;
+  maxRequestItems: number;
   truncateHeadChars: number;
 }
 
@@ -130,73 +133,30 @@ export interface CompactResult {
     resultsDropped: number;
     callsDropped: number;
     pinned: number;
+    /** Estimated tokens of the shared outline. */
     stateTokens: number;
-    /** Which fitting stage the state needed, '' when no request was made. */
+    /** Which fitting stage the outline needed, '' when no request was made. */
     stateStage: string;
     requests: number;
+    /** Model time the server reported, summed over requests. */
+    modelMs: number;
     ms: number;
   };
 }
 
-/** The `state` of a Jev request: a string or any JSON-serialisable object. */
-export type JevState = string | object;
+/** Yes/no questions by id; the same questions are asked of every item. */
+export type DecisionQuestions = Record<string, string>;
 
-export interface NoulQuestion {
-  type: 'noul';
-  instructions: string;
-  criteria?: {
-    true?: string;
-    false?: string;
-  };
-}
+/** P(yes) per question id, one row per item. */
+export type DecisionAnswers = Record<string, number>[];
 
-export interface ChoiceQuestion {
-  type: 'choice';
-  instructions: string;
-  criteria: Record<string, string | null>;
-}
-
-export interface ScoreQuestion {
-  type: 'score';
-  instructions: string;
-  criteria: string[];
-}
-
-export type JevQuestion = NoulQuestion | ChoiceQuestion | ScoreQuestion;
-export type JevQuestions = Record<string, JevQuestion>;
-
-export interface NoulAnswer {
-  type?: 'noul';
-  noul: number;
-}
-
-export interface ChoiceAnswer {
-  type?: 'choice';
-  choice: string;
-  confidence: number;
-  probabilities: Record<string, number>;
-}
-
-export interface ScoreAnswer {
-  type?: 'score';
-  score: number;
-  confidence: number;
-  probabilities: Record<string, number>;
-}
-
-export type JevAnswer = NoulAnswer | ChoiceAnswer | ScoreAnswer;
-
-export interface JevResponse {
+export interface DecideResponse {
   model?: string;
-  answers: Record<string, JevAnswer>;
-  usage?: {
-    input_tokens?: number;
-    output_tokens?: number;
-  };
-  [key: string]: unknown;
+  answers: DecisionAnswers;
+  ms?: number;
 }
 
-/** Anything that can answer Jev questions: `JevClient`, or a host-provided adapter. */
-export interface JevAsker {
-  ask(state: JevState, questions: JevQuestions): Promise<JevResponse>;
+/** Anything that answers yes/no questions over texts: `GlinerClient`, or a host adapter. */
+export interface Decider {
+  decide(items: readonly string[], questions: DecisionQuestions): Promise<DecideResponse>;
 }

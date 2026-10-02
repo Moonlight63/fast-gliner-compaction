@@ -9,11 +9,16 @@ import type {
 } from 'claude-code';
 
 import { compact, reductionRatio, resolveOptions } from '../src/compact.js';
-import { buildJevRequest, DEFAULT_MODEL, parseJevResponse } from '../src/request.js';
+import {
+  buildDecideRequest,
+  DEFAULT_MODEL,
+  DEFAULT_SERVER_URL,
+  parseDecideResponse,
+} from '../src/request.js';
 import type {
   CompactOptions,
   CompactResult,
-  JevAsker,
+  Decider,
   Message,
   ToolResult,
   ToolUse,
@@ -23,6 +28,7 @@ const HOOK_DEFAULTS = {
   compactAtPercent: 60,
   minReductionRatio: 0.25,
   model: DEFAULT_MODEL,
+  serverUrl: DEFAULT_SERVER_URL,
 };
 
 export type HookFetchInit = {
@@ -41,7 +47,8 @@ export type HookFetchResponse = {
 export type HookFetch = (url: string, init?: HookFetchInit) => Promise<HookFetchResponse>;
 
 export type HookConfig = CompactOptions & {
-  apiKey?: string;
+  serverUrl: string;
+  serverToken?: string;
   compactAtPercent: number;
   minReductionRatio: number;
   model: string;
@@ -64,7 +71,8 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
     'keepThreshold',
     'preserveRecentMessages',
     'maxStateTokens',
-    'maxRequestTokens',
+    'focusResultChars',
+    'maxRequestItems',
     'truncateHeadChars',
   ] as const) {
     const value = options[key];
@@ -79,25 +87,35 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
       HOOK_DEFAULTS.minReductionRatio,
     ),
     model: optionString(options, 'model') ?? HOOK_DEFAULTS.model,
+    serverUrl: optionString(options, 'serverUrl') ?? HOOK_DEFAULTS.serverUrl,
   };
-  const apiKey = optionString(options, 'apiKey');
-  if (apiKey) config.apiKey = apiKey;
+  const serverToken = optionString(options, 'serverToken');
+  if (serverToken) config.serverToken = serverToken;
   const goal = optionString(options, 'goal');
   if (goal) config.goal = goal;
   return config;
 }
 
-/** A `JevAsker` over the engine's `$.http.fetch`. */
-export function jevAsker(fetchFn: HookFetch, apiKey: string, model: string): JevAsker {
+/** A `Decider` over the engine's `$.http.fetch`. */
+export function serverDecider(
+  fetchFn: HookFetch,
+  params: { serverUrl: string; token?: string; model: string },
+): Decider {
   return {
-    async ask(state, questions) {
-      const request = buildJevRequest({ apiKey, model }, state, questions);
+    async decide(items, questions) {
+      const request = buildDecideRequest(params, items, questions);
       const response = await fetchFn(request.url, {
         method: request.method,
         headers: request.headers,
         body: request.body,
       });
-      return parseJevResponse(response.status, response.ok, response.text);
+      return parseDecideResponse(
+        response.status,
+        response.ok,
+        response.text,
+        items.length,
+        questions,
+      );
     },
   };
 }
@@ -161,14 +179,18 @@ export type SessionCompaction = {
   messages: SessionMessage[];
 };
 
-/** Runs the library over a session transcript; throws when the key is missing or Jev fails. */
+/** Runs the library over a session transcript; throws when the decision server fails. */
 export async function compactSession(
   messages: readonly SessionMessage[],
   config: HookConfig,
   fetchFn: HookFetch,
 ): Promise<SessionCompaction> {
-  if (!config.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
-  const result = await compact(messages, jevAsker(fetchFn, config.apiKey, config.model), config);
+  const decider = serverDecider(fetchFn, {
+    serverUrl: config.serverUrl,
+    token: config.serverToken,
+    model: config.model,
+  });
+  const result = await compact(messages, decider, config);
   return { result, messages: toSessionMessages(messages, result.messages) };
 }
 
@@ -186,7 +208,7 @@ export function summarize(result: CompactResult): string {
   ].filter(Boolean);
   return `${percent(reductionRatio(result))} reduction; ${
     parts.join(', ') || 'no tool calls'
-  }; state ~${stats.stateTokens} tokens (${stats.stateStage}) in ${stats.requests} request(s)`;
+  }; outline ~${stats.stateTokens} tokens (${stats.stateStage}), ${stats.requests} request(s), model ${stats.modelMs}ms`;
 }
 
 const UI_LOG_MAX_CHARS = 4096;
@@ -224,23 +246,42 @@ export function decisionLogLines(
   );
 }
 
-async function getApiKey(
-  $: {
-    env: { get: (name: string) => Promise<string | undefined> };
-    settings: { read: () => Promise<Readonly<Record<string, unknown>>> };
-  },
-  config: HookConfig,
-): Promise<string | undefined> {
-  if (config.apiKey) return config.apiKey;
-  const fromEnv = await $.env.get('TYPESAFE_API_KEY');
+type EnvAccess = {
+  env: { get: (name: string) => Promise<string | undefined> };
+  settings: { read: () => Promise<Readonly<Record<string, unknown>>> };
+};
+
+/** An environment value from the process, then from settings.json `env`. */
+async function getEnv($: EnvAccess, name: string): Promise<string | undefined> {
+  const fromEnv = await $.env.get(name);
   if (fromEnv) return fromEnv;
   const settings = await $.settings.read();
   const env = settings['env'];
   if (env && typeof env === 'object') {
-    const value = (env as Record<string, unknown>)['TYPESAFE_API_KEY'];
+    const value = (env as Record<string, unknown>)[name];
     if (typeof value === 'string' && value) return value;
   }
   return undefined;
+}
+
+/**
+ * Plugin options win; `FGC_SERVER_URL` / `FGC_TOKEN` fill in what they leave
+ * unset, so a remote GPU host can be configured once in settings.json.
+ */
+async function withServerEnv(
+  $: EnvAccess,
+  options: PluginOptions,
+  config: HookConfig,
+): Promise<HookConfig> {
+  const resolved = { ...config };
+  if (!optionString(options, 'serverUrl')) {
+    resolved.serverUrl = (await getEnv($, 'FGC_SERVER_URL')) ?? config.serverUrl;
+  }
+  if (!config.serverToken) {
+    const token = await getEnv($, 'FGC_TOKEN');
+    if (token) resolved.serverToken = token;
+  }
+  return resolved;
 }
 
 function notify(
@@ -262,7 +303,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
 
   on('session.compact', async ($, event, next) => {
     try {
-      const config = { ...configured, apiKey: await getApiKey($, configured) };
+      const config = await withServerEnv($, options, configured);
       const { result, messages } = await compactSession(event.messages, config, async (url, init) => {
         const response = await $.http.fetch(url, init);
         return { status: response.status, ok: response.ok, text: response.text };
