@@ -48,6 +48,7 @@ server loads it on first use.
 | `gliner-decide` (default) | `fastino/GLiNER2.5-Decide` (340M, DeBERTa-v3-large) | 8192 | Sharpest in the long-context needle test; ~2 GB VRAM in fp16 |
 | `gliner-decide-1b` | `fastino/GLiNER2.5-Decide-1B` (Ettin 1B) | 4096 (capped) | Needs `server/compat.py` (see below); ~2.5× slower, softer past ~4k tokens |
 | `gliner-multi-decide` | `fastino/GLiNER2.5-multi-Decide` | 4096 | Multilingual transcripts |
+| `gliner25-base` / `gliner25-multi` / `gliner25-small` | `fastino/gliner2.5-{base,multi,small}-v1` | 4096 | General-purpose GLiNER2.5; also need `compat.py` |
 | `laya` | `convaiinnovations/laya` (ModernBERT 421M) | 512 | Failed the needle test even at 50 words |
 | `laya-multilingual` | `laya-multilingual` (mmBERT 322M) | 8192 | Could not separate yes from no at 300 words or more |
 
@@ -56,14 +57,41 @@ Run `python server/needle_test.py <model>` to check a model on your hardware.
 labels a dropped result as "needed" when its content reappears later in the
 session, and reports AUC against recency and size baselines.
 
-### GLiNER2.5-Decide-1B under transformers 4.x
+### First results (zero-shot, 2026-10-01)
 
-gliner2 2.0 pins `transformers<5`, but the 1B checkpoint was saved by
-transformers 5.17. `server/compat.py` handles two incompatibilities. First, the
-tokenizer config names a 5.x-only class. Second, ModernBERT's
-`rope_parameters`, which 4.x silently ignores, so the sliding-window layers run
-at `rope_theta=10000` instead of 160000. The model then loads without error and
-answers ~0.5 to everything.
+The run covered 4 Claude Code sessions, each cut at 40/60/80%, for about 1,480
+decisions, of which 64–68 were "needed." Scores are AUC: 0.5 is chance. AUC is
+controlled for result size and position, because the proxy label favors long
+outputs. The size column is controlled for size only.
+
+| Model | Size + position | Size only | Median P(keep) |
+| --- | ---: | ---: | ---: |
+| baseline: keep newer calls | — | 0.66 | — |
+| `gliner25-multi` | **0.64** | 0.67 | 0.15 |
+| `laya` | 0.59 | 0.54 | 0.79 |
+| `gliner25-base` | 0.53 | 0.52 | 0.68 |
+| `gliner-decide-1b` | 0.50 | 0.51 | 0.46 |
+| `gliner25-small` | 0.47 | 0.45 | 0.85 |
+| `laya-multilingual` | 0.44 | 0.48 | 0.95 |
+| `gliner-decide` | 0.42 | 0.43 | 0.23 |
+
+- Only `gliner25-multi` carries a signal independent of recency. Its score has
+  no correlation with position (Spearman 0.04).
+- No model's 0.5 threshold is usable as is: the medians range from 0.15 to
+  0.95, so each needs recalibration.
+- With so few positives, treat differences under about 0.07 as noise.
+
+### Checkpoints saved by transformers 5
+
+gliner2 2.0 pins `transformers<5`, but Decide-1B and the `gliner2.5-*-v1`
+checkpoints were saved by transformers 5. `server/compat.py` handles two
+incompatibilities:
+
+- The tokenizer configs list `extra_special_tokens` in the 5.x format, and
+  Decide-1B's names a 5.x-only class.
+- Decide-1B's ModernBERT `rope_parameters` are ignored by 4.x, so its
+  sliding-window layers run at `rope_theta=10000` instead of 160000. The model
+  then loads without error and answers ~0.5 to everything.
 
 ## Running the decision server
 
@@ -92,6 +120,10 @@ python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 FGC_MODELS=gliner-decide python app.py   # http://127.0.0.1:8765
 ```
+
+`./start.sh` (re)starts the server detached, using the same environment
+variables. The server writes its PID to `server.pid` and its output to
+`server.log`.
 
 On a CPU, lower `maxStateTokens` (for example to 1500), because cost grows
 quadratically with item length.
@@ -155,8 +187,8 @@ npm run validate:plugin
 
 ## Limitations
 
-- Calibration is not validated. In early runs, `gliner-decide` scored most
-  results below 0.5, so `keepThreshold` may need tuning per model. Use the eval
-  harness before trusting the defaults.
+- Zero-shot, no model has yet beaten a "keep newer calls" baseline on its
+  own, and none is calibrated (see "First results"). Use the eval harness
+  before trusting any default.
 - Only tool calls and results are candidates; text messages are never removed.
 - Token sizes are estimates; the server truncates at each model's limit.

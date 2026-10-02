@@ -7,3 +7,7 @@ eval-results.json
 eval-run.log
 server/.venv/
 __pycache__/
+eval-results*.json
+eval-run*.log
+server/server.pid
+server/server.log

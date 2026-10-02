@@ -17,6 +17,10 @@ MODELS: Dict[str, tuple] = {
     "gliner-decide": ("gliner", "fastino/GLiNER2.5-Decide", 8192),
     "gliner-decide-1b": ("gliner", "fastino/GLiNER2.5-Decide-1B", 4096),
     "gliner-multi-decide": ("gliner", "fastino/GLiNER2.5-multi-Decide", 4096),
+    # General-purpose GLiNER2.5 checkpoints (extraction + classification heads).
+    "gliner25-base": ("gliner", "fastino/gliner2.5-base-v1", 4096),
+    "gliner25-multi": ("gliner", "fastino/gliner2.5-multi-v1", 4096),
+    "gliner25-small": ("gliner", "fastino/gliner2.5-small-v1", 4096),
     "laya": ("laya", "english", 512),
     "laya-multilingual": ("laya", "multilingual", 8192),
 }

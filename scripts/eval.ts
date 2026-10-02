@@ -118,6 +118,27 @@ function auc(scores: number[], labels: boolean[]): number {
   return (rankSum - (positives * (positives + 1)) / 2) / (positives * negatives);
 }
 
+/**
+ * AUC within result-size quintiles, weighted by positives. The proxy label is
+ * confounded with size (a long result has more lines that can reappear), so
+ * this is the number to compare; raw AUC rewards "keep the big ones".
+ */
+function stratifiedAuc(samples: readonly Sample[], score: (s: Sample) => number): number {
+  const sorted = [...samples].sort((a, b) => a.chars - b.chars);
+  let weighted = 0;
+  let weight = 0;
+  for (let q = 0; q < 5; q++) {
+    const bucket = sorted.slice(Math.floor((q * sorted.length) / 5), Math.floor(((q + 1) * sorted.length) / 5));
+    const value = auc(bucket.map(score), bucket.map((s) => s.needed));
+    const positives = bucket.filter((s) => s.needed).length;
+    if (!Number.isNaN(value)) {
+      weighted += value * positives;
+      weight += positives;
+    }
+  }
+  return weight === 0 ? Number.NaN : weighted / weight;
+}
+
 function arg(name: string, fallback: string): string {
   const index = process.argv.indexOf(`--${name}`);
   return index >= 0 ? process.argv[index + 1] ?? fallback : fallback;
@@ -195,11 +216,14 @@ async function main(): Promise<void> {
   const positives = labels.filter(Boolean).length;
   const rows: string[] = [];
   rows.push(`samples=${samples.length} needed=${positives} (${((100 * positives) / samples.length).toFixed(1)}% base rate)`);
-  rows.push('model                 AUC(result)  AUC(call)  kept-needed@0.5  dropped@0.5  reduction  ms/item');
-  const line = (name: string, a: number, b: number, recall: number, dropped: number, red: number, ms: number) =>
-    `${name.padEnd(22)}${a.toFixed(3).padStart(10)}${(Number.isNaN(b) ? '   -' : b.toFixed(3)).padStart(11)}${(recall * 100).toFixed(1).padStart(15)}%${(dropped * 100).toFixed(1).padStart(12)}%${(red * 100).toFixed(1).padStart(10)}%${ms.toFixed(1).padStart(9)}`;
-  rows.push(line('baseline:recency', auc(samples.map((s) => s.position), labels), Number.NaN, Number.NaN, Number.NaN, Number.NaN, 0));
-  rows.push(line('baseline:size(small)', auc(samples.map((s) => -s.chars), labels), Number.NaN, Number.NaN, Number.NaN, Number.NaN, 0));
+  rows.push('model                 AUC(size-ctl)  AUC(raw)  AUC(call)  kept-needed@0.5  dropped@0.5  reduction  ms/item');
+  const fmt = (value: number, width: number) => (Number.isNaN(value) ? '-' : value.toFixed(3)).padStart(width);
+  const pct = (value: number, width: number) => (Number.isNaN(value) ? '-' : `${(value * 100).toFixed(1)}%`).padStart(width);
+  const line = (name: string, ctl: number, a: number, b: number, recall: number, dropped: number, red: number, ms: number) =>
+    `${name.padEnd(22)}${fmt(ctl, 13)}${fmt(a, 10)}${fmt(b, 11)}${pct(recall, 17)}${pct(dropped, 13)}${pct(red, 11)}${ms.toFixed(1).padStart(9)}`;
+  const none = Number.NaN;
+  rows.push(line('baseline:recency', stratifiedAuc(samples, (s) => s.position), auc(samples.map((s) => s.position), labels), none, none, none, none, 0));
+  rows.push(line('baseline:size(large)', none, auc(samples.map((s) => s.chars), labels), none, none, none, none, 0));
   for (const model of models) {
     const keepResult = samples.map((s) => s.scores[model]?.keepResult ?? 1);
     const keepCall = samples.map((s) => s.scores[model]?.keepCall ?? 1);
@@ -208,7 +232,16 @@ async function main(): Promise<void> {
     const t = timing[model]!;
     const reduction = t.reduction.reduce((a, b) => a + b, 0) / Math.max(1, t.reduction.length);
     rows.push(
-      line(model, auc(keepResult, labels), auc(keepCall, labels), kept / Math.max(1, positives), dropped / samples.length, reduction, t.modelMs / Math.max(1, t.items)),
+      line(
+        model,
+        stratifiedAuc(samples, (s) => s.scores[model]?.keepResult ?? 1),
+        auc(keepResult, labels),
+        auc(keepCall, labels),
+        kept / Math.max(1, positives),
+        dropped / samples.length,
+        reduction,
+        t.modelMs / Math.max(1, t.items),
+      ),
     );
   }
   console.log(rows.join('\n'));

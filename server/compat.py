@@ -1,9 +1,11 @@
 """Load-time fixes for checkpoints saved by transformers 5 under gliner2's transformers<5 pin.
 
-`fastino/GLiNER2.5-Decide-1B` was saved with transformers 5.17. Under 4.x:
+Several GLiNER2.5 checkpoints (Decide-1B, gliner2.5-*-v1) were saved with
+transformers 5. Under 4.x:
 
-- its tokenizer_config names `TokenizersBackend` (a 5.x class) and lists
-  `extra_special_tokens` as a list, so `AutoTokenizer` cannot load it;
+- their tokenizer_config lists `extra_special_tokens` as a list (4.x wants a
+  dict), and Decide-1B's also names `TokenizersBackend` (a 5.x class), so
+  `AutoTokenizer` cannot load them;
 - its ModernBERT encoder config stores rope settings as `rope_parameters`,
   which 4.x ignores, silently running the sliding-window layers with
   local_rope_theta=10000 instead of 160000. The model then loads without an
@@ -25,19 +27,32 @@ def _patch_tokenizer() -> None:
     original = AutoTokenizer.from_pretrained.__func__
 
     def from_pretrained(cls, name, *args, **kwargs):
-        try:
-            return original(cls, name, *args, **kwargs)
-        except ValueError as error:
-            if "TokenizersBackend" not in str(error):
-                raise
         from huggingface_hub import hf_hub_download
 
         def fetch(filename: str) -> str:
             local = os.path.join(str(name), filename)
             return local if os.path.isfile(local) else hf_hub_download(str(name), filename)
 
-        with open(fetch("tokenizer_config.json"), encoding="utf-8") as handle:
-            config = json.load(handle)
+        def saved_config() -> dict:
+            with open(fetch("tokenizer_config.json"), encoding="utf-8") as handle:
+                return json.load(handle)
+
+        try:
+            return original(cls, name, *args, **kwargs)
+        except (ValueError, AttributeError, ImportError) as error:
+            config = saved_config()
+            extra = config.get("extra_special_tokens")
+            if "TokenizersBackend" not in str(error) and not isinstance(extra, list):
+                raise
+        if config.get("tokenizer_class") != "TokenizersBackend":
+            # A real 4.x class whose config lists extra_special_tokens (5.x
+            # format; 4.x expects a dict): pass them the 4.x way.
+            return original(
+                cls,
+                name,
+                *args,
+                **{**kwargs, "extra_special_tokens": {}, "additional_special_tokens": list(extra)},
+            )
         special = {
             key: config[key]
             for key in ("cls_token", "sep_token", "pad_token", "mask_token", "unk_token")
