@@ -1,26 +1,26 @@
 /**
- * Evaluates the "is this expensive to re-run?" check on real Claude Code
- * transcripts.
+ * Measures what compaction would lose on real Claude Code transcripts.
  *
- *   npx tsx scripts/eval.ts [--models a,b] [--threshold 0.7] [--out eval-report.md] file.jsonl...
+ *   npx tsx scripts/eval.ts [--model gliner-decide-1b] [--cuts 0.4,0.6,0.8] [--out eval-report.md] file.jsonl...
  *
- * 1. Every tool call is classified by the rules (cheap / expensive / unknown).
- * 2. Rule-labelled calls are a check set: each model sees the call without the
- *    label, and we measure whether its P(expensive) agrees with the rules.
- *    Shell commands are reported separately, because there the model has to
- *    read the command; for named tools the tool name gives a lot away.
- * 3. Unknown calls are what the model decides in practice. They are listed in
- *    the report with each model's score, for a human to eyeball.
- * 4. Each transcript is compacted as a whole, to show how much it frees.
+ * Each transcript is cut at several points and the part before the cut is
+ * compacted. A tool output counts as "used later" when one of its distinctive
+ * lines (>= 25 chars) reappears after the cut in the assistant's text or tool
+ * inputs: the assistant quoted it, or edited code it had read. For every
+ * used-later output we check whether that line survived compaction (kept
+ * whole, or inside a trimmed head/tail). That is the loss that matters;
+ * everything else removed is free space.
+ *
+ * The label only sees verbatim reuse, so it misses information that guided a
+ * decision without being quoted. Treat "lost" as a lower bound.
  */
 import { readFileSync, writeFileSync } from 'node:fs';
 import { basename } from 'node:path';
 
 import { GlinerClient } from '../src/client.js';
-import { askCosts, compact, resolveOptions } from '../src/compact.js';
-import { costRules, ruleCost } from '../src/cost.js';
-import { collectToolCalls } from '../src/state.js';
-import type { Message, RerunCost, ToolCall } from '../src/types.js';
+import { compact } from '../src/compact.js';
+import { collectToolCalls, resultText } from '../src/state.js';
+import type { CallDecision, Message } from '../src/types.js';
 
 type Block = {
   type: string;
@@ -79,164 +79,134 @@ export function loadTranscript(file: string): Message[] {
   return messages;
 }
 
-/** Area under the ROC curve: P(score of a random positive > a random negative). */
-function auc(scores: number[], labels: boolean[]): number {
-  const pairs = scores.map((s, i) => [s, labels[i]] as const).sort((a, b) => a[0] - b[0]);
-  let rankSum = 0;
-  let positives = 0;
-  for (let i = 0; i < pairs.length; ) {
-    let j = i;
-    while (j < pairs.length && pairs[j]![0] === pairs[i]![0]) j++;
-    for (let k = i; k < j; k++) {
-      if (pairs[k]![1]) {
-        rankSum += (i + j + 1) / 2;
-        positives++;
-      }
-    }
-    i = j;
+/** Distinctive lines of a tool result, with Read's `   12→` gutters removed. */
+function distinctiveLines(text: string): string[] {
+  const lines = new Set<string>();
+  for (const raw of text.split('\n')) {
+    const line = raw.replace(/^\s*\d+[→\t]/, '').trim();
+    if (line.length >= 25 && /[A-Za-z]{3}/.test(line)) lines.add(line);
   }
-  const negatives = pairs.length - positives;
-  if (positives === 0 || negatives === 0) return Number.NaN;
-  return (rankSum - (positives * (positives + 1)) / 2) / (positives * negatives);
+  return [...lines];
 }
+
+/** Assistant text and tool inputs after the cut, raw and JSON-escaped forms both searchable. */
+function futureText(suffix: readonly Message[]): string {
+  const parts: string[] = [];
+  for (const message of suffix) {
+    if (message.role !== 'assistant') continue;
+    parts.push(message.text);
+    for (const tool of message.toolUses) parts.push(JSON.stringify(tool.input));
+  }
+  return parts.join('\n');
+}
+
+const used = (line: string, future: string): boolean =>
+  future.includes(line) || future.includes(JSON.stringify(line).slice(1, -1));
 
 function arg(name: string, fallback: string): string {
   const index = process.argv.indexOf(`--${name}`);
   return index >= 0 ? process.argv[index + 1] ?? fallback : fallback;
 }
 
-function describe(call: ToolCall): string {
-  const command = call.input.command;
-  const text = typeof command === 'string' ? command : JSON.stringify(call.input);
-  return `${call.tool} ${text.replace(/\s+/g, ' ').slice(0, 110)}`;
-}
-
 interface Row {
   file: string;
-  call: ToolCall;
-  shell: boolean;
-  rule: RerunCost;
-  p: Record<string, number>;
+  cut: number;
+  decision: CallDecision;
+  describe: string;
+  chars: number;
+  usedLater: boolean;
+  preserved: boolean;
 }
 
 async function main(): Promise<void> {
-  const models = arg('models', 'gliner25-multi,gliner25-base,gliner-decide-1b').split(',');
-  const threshold = Number(arg('threshold', '0.7'));
+  const model = arg('model', 'gliner-decide-1b');
+  const cuts = arg('cuts', '0.4,0.6,0.8').split(',').map(Number);
   const out = arg('out', 'eval-report.md');
-  const flags = new Set(['--models', '--threshold', '--out']);
+  const flags = new Set(['--model', '--cuts', '--out']);
   const files = process.argv.slice(2).filter((a, i, all) => !a.startsWith('--') && !flags.has(all[i - 1] ?? ''));
   if (files.length === 0) throw new Error('pass one or more transcript .jsonl files');
 
-  const rules = costRules();
-  const options = resolveOptions();
   const rows: Row[] = [];
-  const reduction: string[] = [];
+  const freed: string[] = [];
   for (const file of files) {
-    const messages = loadTranscript(file);
-    const calls = collectToolCalls(messages, 0);
-    const fileRows = calls.map((call): Row => ({
-      file: basename(file),
-      call,
-      shell: typeof call.input.command === 'string' || Array.isArray(call.input.commands),
-      rule: ruleCost(call, rules),
-      p: {},
-    }));
-    for (const model of models) {
-      const { pExpensive } = await askCosts(new GlinerClient({ model }), messages, calls, options);
-      for (const row of fileRows) row.p[model] = pExpensive.get(row.call.id)!;
-      console.error(`${basename(file)} ${model}: ${calls.length} calls scored`);
-    }
-    rows.push(...fileRows);
-    for (const model of models) {
-      const result = await compact(messages, new GlinerClient({ model }), { spareThreshold: threshold });
+    const all = loadTranscript(file);
+    for (const cut of cuts) {
+      const at = Math.floor(all.length * cut);
+      const prefix = all.slice(0, at);
+      const future = futureText(all.slice(at));
+      const result = await compact(prefix, new GlinerClient({ model }));
+      const after = result.messages
+        .flatMap((m) => [m.text, ...(m.toolResults ?? []).map((r) => r.text), ...m.toolUses.map((t) => t.text ?? '')])
+        .join('\n');
+      const calls = collectToolCalls(prefix, 6);
+      const decisions = new Map(result.decisions.map((d) => [d.id, d]));
+      for (const call of calls) {
+        const decision = decisions.get(call.id)!;
+        if (decision.reason === 'pinned') continue;
+        const text = resultText(prefix, call);
+        const reused = distinctiveLines(text).filter((line) => used(line, future));
+        const command = typeof call.input.command === 'string' ? call.input.command : JSON.stringify(call.input);
+        rows.push({
+          file: basename(file),
+          cut,
+          decision,
+          describe: `${call.tool} ${command.replace(/\s+/g, ' ').slice(0, 100)}`,
+          chars: text.length,
+          usedLater: reused.length > 0,
+          preserved: reused.length > 0 && (decision.action === 'keep' || reused.some((line) => after.includes(line))),
+        });
+      }
       const s = result.stats;
-      reduction.push(
-        `| ${basename(file).slice(0, 8)} | ${model} | ${s.calls} | ${s.byRule} | ${s.byModel} | ${s.resultsDropped} | ${s.kept - s.pinned} | ${Math.round((100 * (s.charsBefore - s.charsAfter)) / Math.max(1, s.charsBefore))}% |`,
+      freed.push(
+        `| ${basename(file).slice(0, 8)} | ${cut} | ${s.messagesBefore} | ${s.calls} | ${s.removed} | ${s.trimmed} | ${s.kept - s.pinned} | ${s.byModel} | ${Math.round((100 * (s.charsBefore - s.charsAfter)) / Math.max(1, s.charsBefore))}% |`,
       );
+      console.error(`${basename(file)} cut=${cut}: ${s.calls} calls, ${s.byModel} asked, model ${s.modelMs}ms${s.modelError ? ` (${s.modelError})` : ''}`);
     }
   }
 
-  const lines: string[] = [];
-  const counts = { cheap: 0, expensive: 0, unknown: 0 };
-  for (const row of rows) counts[row.rule]++;
-  lines.push(`# Re-run cost eval`, '', `${rows.length} tool calls from ${files.length} transcripts.`);
-  lines.push(`Rules: ${counts.cheap} cheap, ${counts.expensive} expensive, ${counts.unknown} unknown (${((100 * counts.unknown) / rows.length).toFixed(1)}% left to the model).`, '');
+  const usedRows = rows.filter((r) => r.usedLater);
+  const lost = usedRows.filter((r) => !r.preserved);
+  const lines: string[] = [`# Compaction loss eval (model: ${model})`, ''];
+  lines.push(
+    `${rows.length} tool outputs outside the pinned messages, over ${files.length} transcripts × ${cuts.length} cut points.`,
+    `${usedRows.length} (${((100 * usedRows.length) / rows.length).toFixed(1)}%) were used later. **${lost.length} of them lost their used information** (${((100 * lost.length) / Math.max(1, usedRows.length)).toFixed(0)}%); ${usedRows.length - lost.length} kept it.`,
+    '',
+  );
 
-  lines.push('## Agreement with the rules on rule-labelled calls', '');
-  lines.push(`Threshold ${threshold}: "spared" means P(expensive) >= ${threshold}.`, '');
-  lines.push('| Model | Subset | n (expensive) | AUC | Cheap correctly dropped | Expensive correctly spared |');
-  lines.push('| --- | --- | --- | ---: | ---: | ---: |');
-  for (const model of models) {
-    for (const [subset, filter] of [
-      ['all', (r: Row) => r.rule !== 'unknown'],
-      ['shell commands', (r: Row) => r.rule !== 'unknown' && r.shell],
-      ['named tools', (r: Row) => r.rule !== 'unknown' && !r.shell],
-    ] as const) {
-      const set = rows.filter(filter);
-      const expensive = set.filter((r) => r.rule === 'expensive');
-      const cheap = set.filter((r) => r.rule === 'cheap');
-      const a = auc(set.map((r) => r.p[model]!), set.map((r) => r.rule === 'expensive'));
-      const dropOk = cheap.filter((r) => r.p[model]! < threshold).length / Math.max(1, cheap.length);
-      const spareOk = expensive.filter((r) => r.p[model]! >= threshold).length / Math.max(1, expensive.length);
-      lines.push(
-        `| ${model} | ${subset} | ${set.length} (${expensive.length}) | ${Number.isNaN(a) ? '-' : a.toFixed(3)} | ${(100 * dropOk).toFixed(0)}% | ${(100 * spareOk).toFixed(0)}% |`,
-      );
-    }
+  lines.push('## By decision', '');
+  lines.push('| Action | Reason | Outputs | Used later | Used info lost | Result chars |');
+  lines.push('| --- | --- | ---: | ---: | ---: | ---: |');
+  const groups = new Map<string, Row[]>();
+  for (const row of rows) {
+    const key = `${row.decision.action}|${row.decision.reason}`;
+    groups.set(key, [...(groups.get(key) ?? []), row]);
+  }
+  for (const [key, group] of [...groups].sort((a, b) => b[1].length - a[1].length)) {
+    const [action, reason] = key.split('|');
+    lines.push(
+      `| ${action} | ${reason} | ${group.length} | ${group.filter((r) => r.usedLater).length} | ${group.filter((r) => r.usedLater && !r.preserved).length} | ${group.reduce((t, r) => t + r.chars, 0)} |`,
+    );
   }
 
-  lines.push('', '## Threshold sweep on rule-labelled calls', '');
-  lines.push('Lowest threshold at which the model drops at least the given share of cheap calls, and how many expensive calls it still spares there.', '');
-  lines.push('| Model | Cheap dropped ≥ | Threshold | Expensive spared |');
-  lines.push('| --- | ---: | ---: | ---: |');
-  for (const model of models) {
-    const labelled = rows.filter((r) => r.rule !== 'unknown');
-    const cheapScores = labelled.filter((r) => r.rule === 'cheap').map((r) => r.p[model]!).sort((a, b) => a - b);
-    const expensive = labelled.filter((r) => r.rule === 'expensive');
-    for (const share of [0.8, 0.9, 0.95]) {
-      const t = cheapScores[Math.min(cheapScores.length - 1, Math.ceil(share * cheapScores.length) - 1)]! + 1e-9;
-      const spared = expensive.filter((r) => r.p[model]! >= t).length / Math.max(1, expensive.length);
-      lines.push(`| ${model} | ${share * 100}% | ${t.toFixed(3)} | ${(100 * spared).toFixed(0)}% |`);
-    }
+  lines.push('', '## Space freed per cut', '');
+  lines.push('| Session | Cut | Messages | Calls | Removed | Trimmed | Kept | Asked model | Chars freed |');
+  lines.push('| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |');
+  lines.push(...freed);
+
+  const summaryEnd = lines.length;
+  lines.push('', '## Used-later outputs whose used information was lost', '');
+  lines.push('| Session | Cut | Decision | Call |', '| --- | ---: | --- | --- |');
+  for (const row of lost) {
+    lines.push(`| ${row.file.slice(0, 8)} | ${row.cut} | ${row.decision.action}/${row.decision.reason} | \`${row.describe.replace(/[|`]/g, ' ')}\` |`);
   }
-
-  lines.push('', '## Where kept characters go (rules only, largest session)', '');
-  {
-    const largest = files
-      .map((file) => ({ file, messages: loadTranscript(file) }))
-      .sort((a, b) => b.messages.length - a.messages.length)[0]!;
-    const result = await compact(largest.messages, null, {});
-    const calls = collectToolCalls(largest.messages, options.preserveRecentMessages);
-    const byReason = new Map<string, { n: number; chars: number }>();
-    for (const decision of result.decisions.filter((d) => d.action === 'keep')) {
-      const call = calls.find((c) => c.id === decision.id)!;
-      const key = `${decision.reason} ${decision.tool.replace(/^mcp__plugin_[^_]+_[^_]+__/, 'mcp:')}`;
-      const entry = byReason.get(key) ?? { n: 0, chars: 0 };
-      entry.n += 1;
-      entry.chars += call.resultChars;
-      byReason.set(key, entry);
-    }
-    lines.push(`${basename(largest.file)}: ${result.stats.charsBefore} chars before, ${result.stats.charsAfter} after.`, '');
-    lines.push('| Kept because | Results | Chars |', '| --- | ---: | ---: |');
-    for (const [key, { n, chars }] of [...byReason].sort((a, b) => b[1].chars - a[1].chars).slice(0, 12)) {
-      lines.push(`| ${key} | ${n} | ${chars} |`);
-    }
-  }
-
-  lines.push('', '## Whole-transcript compaction', '');
-  lines.push('| Session | Model | Calls | By rule | By model | Truncated | Spared | Chars freed |');
-  lines.push('| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |');
-  lines.push(...reduction);
-
-  lines.push('', '## Calls the rules leave to the model', '');
-  lines.push(`| ${models.map((m) => `P ${m}`).join(' | ')} | Call |`);
-  lines.push(`| ${models.map(() => '---:').join(' | ')} | --- |`);
-  for (const row of rows.filter((r) => r.rule === 'unknown').sort((a, b) => b.p[models[0]!]! - a.p[models[0]!]!)) {
-    lines.push(`| ${models.map((m) => row.p[m]!.toFixed(2)).join(' | ')} | \`${describe(row.call).replace(/[|`]/g, ' ')}\` |`);
+  lines.push('', '## Calls the model decided', '');
+  lines.push('| P(useful) | Action | Used later | Call |', '| ---: | --- | --- | --- |');
+  for (const row of rows.filter((r) => r.decision.pUseful !== undefined).sort((a, b) => b.decision.pUseful! - a.decision.pUseful!)) {
+    lines.push(`| ${row.decision.pUseful!.toFixed(2)} | ${row.decision.action} | ${row.usedLater ? 'yes' : ''} | \`${row.describe.replace(/[|`]/g, ' ')}\` |`);
   }
   writeFileSync(out, `${lines.join('\n')}\n`);
-  const summaryEnd = lines.indexOf('## Calls the rules leave to the model');
   console.log(lines.slice(0, summaryEnd).join('\n'));
-  console.log(`\nfull report with every unclassified call: ${out}`);
+  console.log(`\nfull report (lost outputs, model decisions): ${out}`);
 }
 
 if (process.argv[1]?.endsWith('eval.ts')) {

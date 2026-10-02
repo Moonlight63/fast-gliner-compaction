@@ -1,104 +1,99 @@
 # fast-gliner-compaction
 
-A Claude Code plugin for removal-first compaction. Old tool output is
-truncated by default and kept only when getting it again would be expensive.
-Rules decide the clear cases, and a self-hosted GLiNER2.5 classifier decides
-the rest. Nothing is summarized or rewritten. User and assistant text stays
-verbatim, and every tool call stays in place.
+A Claude Code plugin for removal-first compaction. Each old tool call is
+judged by **how useful its information still is going forward**. Calls whose
+information lives in the workspace, or that a later call has superseded, are
+removed entirely. The latest outcome of each run is trimmed. Research is
+kept. A self-hosted GLiNER2.5 classifier judges what the rules can't place.
+Nothing is summarized or rewritten, and user and assistant text stays
+verbatim.
 
-Forked from [fast-jev-compaction](https://github.com/tamaratran/fast-jev-compaction).
-That plugin asks TypeSafe's hosted Jev model which history is still needed;
-this one asks a simpler, more checkable question about each tool call.
+Forked from [fast-jev-compaction](https://github.com/tamaratran/fast-jev-compaction),
+which uses TypeSafe's hosted Jev model to decide what to drop.
 
-## Why removal-first
+## The idea
 
-In our sessions, about 95% of old tool output was never referenced again (see
-"Evaluation"). Removing it is also cheap to undo. A removed result leaves its
-call and the first 300 characters in place, and the assistant can re-run the
-tool. The real risk is losing output that cannot be re-run for free: a long
-test run, a web fetch, a subagent's report, a user's answer, or a one-off
-database snapshot. So the plugin asks one question: **would it be expensive to
-get this output again?**
+What matters is not how expensive a call was, but whether its information is
+still needed and whether the workspace already holds it. A `Write` may have
+taken effort to produce, but its content is now in the file, and reading the
+file back is cheap. In our sessions, 0 of 231 old `Write`/`Edit` outputs were
+ever referenced again.
 
-## How it works
+| Kind of call | What happens | Why |
+| --- | --- | --- |
+| **Workspace:** `Read`, `Write`, `Edit`, `Grep`, `Glob`, read-only or local shell (`grep`, `sed`, `cat`, `ls`, `git status/add/commit`, `cp`…) | **Removed**, call and result | The files hold the information; re-read when needed |
+| **Superseded:** a later call targets the same file, command, URL or query | **Removed** | The newer call has the current state |
+| **Outcome:** running something, such as tests, builds, installs, `npx`, `ssh`, `git push`, `docker build` | Latest run **trimmed** to its first and last 300 characters | Pass/fail and the summary are usually at the ends |
+| **Research:** `WebFetch`, `WebSearch`, subagents, `AskUserQuestion`, MCP fetch/search, `curl`, `gh`, code that calls `fetch` | **Kept** | Not in the workspace; expensive or impossible to re-derive |
+| **Unknown:** ad-hoc `node`/`python3` scripts, `docker exec`, unfamiliar MCP tools | **Model decides:** kept if P(still useful) ≥ `keepThreshold`, otherwise trimmed | — |
 
-1. Every `tool_use` is paired with its `tool_result`. Calls in the first
-   message or the newest `preserveRecentMessages` messages are pinned and left
-   alone.
-2. Rules classify each remaining call:
-   - **Cheap.** `Read`, `Grep`, `Glob`, `Edit`, `Write`, and similar local
-     lookups and edit confirmations. Also shell commands made only of
-     read-only or local programs (`grep`, `sed`, `cat`, `ls`, `git status`,
-     `git log`, `docker logs`, and so on).
-   - **Expensive.** `WebFetch`, `WebSearch`, `Agent`/`Task`,
-     `AskUserQuestion`, MCP fetch and search tools, and code that calls
-     `fetch`. Also shell commands with any test, build, install, network, or
-     remote step (`npm test`, `npx`, `bun run`, `pytest`, `tsc`, `curl`,
-     `ssh`, `git push`, `docker build`, …).
-   - **Unknown.** Everything else, such as ad-hoc `node -e`/`python3`
-     scripts, `docker exec`, and unfamiliar MCP tools.
+The first message and the newest `preserveRecentMessages` messages are never
+touched.
 
-   The shell parser understands quoting, pipes, heredocs, loops, `$(…)`, and
-   functions. In our sessions the rules left only about 15% of calls to the
-   model.
-3. For **unknown** calls only, the model sees the tool, its input, and the
-   first `focusResultChars` characters of its output. It is asked whether
-   re-running would be expensive. The output is kept when P(expensive) ≥
-   `spareThreshold`.
-4. Each removed result keeps `truncateHeadChars` characters and a note. Long
-   string inputs of its call (for example a `Write`'s file content) are
-   shortened to `truncateInputChars`. Paths and commands stay whole.
-5. If the decision server is down, compaction still runs on the rules. Unknown
-   outputs are kept, and the toast says why. If the reduction is below
-   `minReductionRatio`, the built-in summary runs instead.
+Each run of removed calls leaves a single trace line, so the assistant still
+knows what it touched:
 
-Add your own rules with the `cheapTools` and `expensiveTools` options. They
-take comma-separated tool-name globs such as `mcp__db__*` and win over the
-built-in rules.
+```
+[fast-gliner-compaction removed 7 tool calls: Read src/auth/session.ts, Edit src/auth/session.ts ×3, Write src/auth/new.ts, Bash git add -A]
+```
+
+The shell parser understands quoting, pipes, heredocs, loops, `$(…)`, and
+functions. A command takes the strongest category of its parts, so
+`ls && npm test` counts as an outcome. Add your own rules with `removeTools`
+and `keepTools`, which take comma-separated tool-name globs such as
+`mcp__db__*`.
+
+If the decision server is down, compaction still runs on the rules, and
+unknown outputs are trimmed.
 
 ## Evaluation
 
-`npm run eval -- <session.jsonl…>` writes `eval-report.md`. The report has
-four parts:
+`npm run eval -- <session.jsonl…>` cuts each session at 40/60/80% and
+compacts what came before the cut.
 
-- **Rule coverage.** How many calls the rules decide.
-- **Model agreement on rule-labelled calls.** The model sees each call
-  without its label. The report says whether the model agrees with the rules,
-  with shell commands separated out, because there the model has to read the
-  command.
-- **A threshold sweep.**
-- **Every call left to the model, with its score,** so you can review the
-  model's judgement on exactly the calls it decides.
+- **Used later.** An output counts as "used later" when one of its
+  distinctive lines reappears after the cut in the assistant's text or tool
+  inputs. For example, the assistant quoted it, or edited code it had read.
+- **Loss.** For each used-later output, the eval checks whether that line
+  survived compaction. That is the loss that matters.
+- **Report.** `eval-report.md` lists every lost output and every call the
+  model decided.
 
-Results on 4 of our sessions (885 tool calls). Two of the sessions overlap,
-because one resumes the other.
+Results on 3 of our sessions × 3 cut points (827 tool outputs):
 
 | | |
 | --- | --- |
-| Decided by rules | 85% (625 cheap, 131 expensive) |
-| Left to the model | 15% (129 calls) |
-| `gliner-decide-1b` agreement, AUC (all / shell / named tools) | 0.73 / 0.65 / 0.82 |
-| At threshold 0.85: cheap correctly removed / expensive correctly kept | 93% / 18% |
-| Characters freed, two long sessions | 53% and 58% |
-| Characters freed, two short sessions | 76% |
+| Characters freed | **76–78%** on a long session, **78–94%** on short ones |
+| Outputs used later | 39 (4.7%) |
+| …whose used information did not survive | 32 |
+| …of which re-readable file content (`Read`, `sed -n`, `cat`, `grep`, `Glob`) | 30, plus 2 directory listings the model trimmed |
+| Research or outcome information lost | 0 |
 
-What remains after compaction is mostly assistant text, which is never
-touched, and the commands themselves.
+| Decision | Outputs | Used later | Lost |
+| --- | ---: | ---: | ---: |
+| remove: workspace | 502 | 33 | 27 |
+| remove: superseded | 171 | 3 | 3 |
+| trim: outcome | 72 | 0 | 0 |
+| trim: model | 68 | 3 | 2 |
+| keep: research | 14 | 0 | 0 |
 
-The model is a weak veto. It removes nearly everything the rules would call
-cheap, but keeps only a minority of what they would call expensive. The rules
-do most of the work. On this question, the general `gliner2.5-base` and
-`-multi` models did worse than chance. An earlier attempt to predict "will
-this output be reused later" found no model that beat simply keeping recent
-calls. That attempt is why the plugin asks about re-run cost instead.
+So the price is roughly one extra file read per compaction, in exchange for
+removing about four-fifths of the context. The label only sees text that was
+reused verbatim, so treat these losses as a lower bound.
+
+Earlier attempts are recorded in the git history. Asking models "will this
+output be needed later?" directly gave chance-level results. "Is it
+expensive to re-run?" was objective but kept the wrong things.
 
 ## Models
 
 The server exposes these names, and the plugin's `model` option picks one.
+The model is consulted only for calls the rules can't place, about 10% of
+calls in our sessions.
 
 | Name | Checkpoint | Reads | Notes |
 | --- | --- | --- | --- |
-| `gliner-decide-1b` (default) | `fastino/GLiNER2.5-Decide-1B` (Ettin 1B) | 4096 (capped) | Best on the re-run-cost question; needs `server/compat.py` |
+| `gliner-decide-1b` (default) | `fastino/GLiNER2.5-Decide-1B` (Ettin 1B) | 4096 (capped) | Needs `server/compat.py` |
 | `gliner-decide` | `fastino/GLiNER2.5-Decide` (340M, DeBERTa-v3-large) | 8192 | Slow on long inputs (eager attention) |
 | `gliner-multi-decide` | `fastino/GLiNER2.5-multi-Decide` | 4096 | Multilingual |
 | `gliner25-base` / `-multi` / `-small` | `fastino/gliner2.5-{base,multi,small}-v1` | 4096 | General-purpose GLiNER2.5; need `compat.py` |
@@ -121,7 +116,7 @@ incompatibilities:
 
 ## Running the decision server
 
-The server is optional. Without it, the plugin runs on rules alone and keeps
+The server is optional. Without it, the plugin runs on rules alone and trims
 unknown outputs.
 
 ### On a GPU host (Docker)
@@ -151,7 +146,7 @@ FGC_MODELS=gliner-decide-1b ./start.sh   # http://127.0.0.1:8765
 ```
 
 `./start.sh` (re)starts the server detached and writes `server.pid` and
-`server.log`. Items are short (one call each), so a CPU is workable.
+`server.log`. Each item is a single call, so a CPU is workable.
 
 | Server env | Default | Meaning |
 | --- | --- | --- |
@@ -191,14 +186,15 @@ To develop from a checkout: `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin
 | --- | --- | --- |
 | `serverUrl` | `FGC_SERVER_URL`, then `http://127.0.0.1:8765` | Decision server |
 | `serverToken` | `FGC_TOKEN` | Bearer token |
-| `model` | `gliner-decide-1b` | Model for calls the rules leave unknown |
-| `spareThreshold` | `0.85` | Minimum P(expensive) to keep an unknown output |
-| `cheapTools` / `expensiveTools` | — | Extra tool-name globs; win over built-in rules |
+| `model` | `gliner-decide-1b` | Model for calls the rules can't place |
+| `keepThreshold` | `0.85` | Minimum P(still useful) to keep an unknown output whole |
+| `removeTools` / `keepTools` | — | Tool-name globs that override the rules |
+| `breadcrumbs` | `true` | Leave a trace line where calls were removed |
 | `preserveRecentMessages` | `6` | Newest messages never touched |
 | `compactAtPercent` | `60` | Context % that triggers compaction |
 | `minReductionRatio` | `0.25` | Below this, fall back to the built-in summary |
-| `truncateHeadChars` | `300` | Characters kept from a removed result |
-| `truncateInputChars` | `300` | Characters kept of each long input field of its call |
+| `trimHeadChars` / `trimTailChars` | `300` / `300` | Kept from each end of a trimmed result |
+| `trimInputChars` | `300` | Kept of each long input field of a trimmed call |
 | `focusResultChars` | `1500` | Result characters shown to the model |
 | `maxRequestItems` | `128` | Items per server request |
 

@@ -1,7 +1,7 @@
 {
   "name": "fast-gliner-compaction",
-  "version": "0.2.0",
-  "description": "Removal-first compaction for Claude Code sessions: old tool output is truncated unless it is expensive to get again, judged by rules and a self-hosted GLiNER2.5 classifier.",
+  "version": "0.3.0",
+  "description": "Removal-first compaction for Claude Code sessions: tool calls whose information is in the workspace or superseded are removed, run outcomes are trimmed, research is kept; a self-hosted GLiNER2.5 classifier judges the rest.",
   "license": "MIT",
   "userConfig": {
     "serverUrl": {
@@ -19,26 +19,32 @@
     "model": {
       "type": "string",
       "title": "Decision model",
-      "description": "Model asked about tool calls the rules cannot classify: gliner-decide-1b (default), gliner-decide, gliner25-base, gliner25-multi, laya, ... The server loads it on first use unless FGC_LAZY=0.",
+      "description": "Model asked about tool calls the rules cannot place: gliner-decide-1b (default), gliner-decide, gliner25-base, gliner25-multi, laya, ... The server loads it on first use unless FGC_LAZY=0.",
       "default": "gliner-decide-1b"
     },
-    "spareThreshold": {
+    "keepThreshold": {
       "type": "number",
-      "title": "Spare threshold",
-      "description": "Minimum model probability that re-running a call would be expensive for its output to be kept. Higher removes more.",
+      "title": "Keep threshold",
+      "description": "Minimum model probability that an unplaced output is still useful for it to be kept whole; below it the output is trimmed. Higher removes more.",
       "default": 0.85
     },
-    "cheapTools": {
+    "removeTools": {
       "type": "string",
-      "title": "Extra cheap tools",
-      "description": "Comma-separated tool-name globs whose output is always cheap to get again (truncated). Wins over the built-in rules.",
+      "title": "Always remove",
+      "description": "Comma-separated tool-name globs (e.g. mcp__db__*) whose calls are always removed. Wins over the built-in rules.",
       "default": ""
     },
-    "expensiveTools": {
+    "keepTools": {
       "type": "string",
-      "title": "Extra expensive tools",
-      "description": "Comma-separated tool-name globs whose output is always kept. Wins over the built-in rules.",
+      "title": "Always keep",
+      "description": "Comma-separated tool-name globs whose calls are always kept. Wins over the rules and Always remove.",
       "default": ""
+    },
+    "breadcrumbs": {
+      "type": "boolean",
+      "title": "Leave a trace of removed calls",
+      "description": "Replace each run of removed calls with one line naming the tools and files involved.",
+      "default": true
     },
     "preserveRecentMessages": {
       "type": "number",
@@ -55,25 +61,31 @@
     "minReductionRatio": {
       "type": "number",
       "title": "Minimum reduction ratio",
-      "description": "Minimum estimated character reduction required to replace history; below it the built-in summary runs instead.",
+      "description": "Minimum character reduction required to replace history; below it the built-in summary runs instead.",
       "default": 0.25
     },
-    "truncateHeadChars": {
+    "trimHeadChars": {
       "type": "number",
-      "title": "Truncated tool result head",
-      "description": "Characters kept from a removed tool result; 0 keeps only the note.",
+      "title": "Trimmed result head",
+      "description": "Characters kept from the start of a trimmed result.",
       "default": 300
     },
-    "truncateInputChars": {
+    "trimTailChars": {
       "type": "number",
-      "title": "Truncated tool input fields",
-      "description": "Characters kept of each long string input field (e.g. a Write's file content) of a call whose result was removed.",
+      "title": "Trimmed result tail",
+      "description": "Characters kept from the end of a trimmed result (where test and build summaries usually are).",
+      "default": 300
+    },
+    "trimInputChars": {
+      "type": "number",
+      "title": "Trimmed input fields",
+      "description": "Characters kept of each long string input field (e.g. an inline script) of a trimmed call.",
       "default": 300
     },
     "focusResultChars": {
       "type": "number",
       "title": "Output shown to the model",
-      "description": "Characters of a tool result shown to the model when judging re-run cost.",
+      "description": "Characters of a tool result shown to the model when judging usefulness.",
       "default": 1500
     },
     "maxRequestItems": {

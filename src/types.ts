@@ -47,24 +47,42 @@ export interface ToolCall {
   pinned: boolean;
 }
 
-/** How costly it would be to get a call's output again by re-running it. */
-export type RerunCost = 'cheap' | 'expensive' | 'unknown';
+/**
+ * Where a call's information lives, which decides how useful it stays:
+ * - `workspace`: in the files, or a quick local lookup away (reads, edits, searches);
+ * - `outcome`: the result of running something (tests, builds, scripts, remote);
+ * - `research`: found outside the workspace (web, subagents, the user);
+ * - `unknown`: no rule applies.
+ */
+export type CallCategory = 'workspace' | 'outcome' | 'research' | 'unknown';
 
-/** Removal-first: a result is dropped (head kept) unless it is spared. */
-export type CallAction = 'keep' | 'drop_result';
+/**
+ * - `remove`: the call and its result go, leaving a one-line trace;
+ * - `trim`: the call stays, its result is cut to its first and last lines;
+ * - `keep`: untouched.
+ */
+export type CallAction = 'remove' | 'trim' | 'keep';
 
 export type DecisionReason =
   /** In the first or newest preserved messages. */
   | 'pinned'
-  /** A rule says re-running is expensive. */
-  | 'expensive'
-  /** A rule says re-running is cheap. */
-  | 'cheap'
-  /** No rule applied; the model judged it expensive. */
-  | 'model_spared'
-  /** No rule applied; the model judged it cheap. */
-  | 'model_dropped'
-  /** No rule applied and the model could not be asked; kept to be safe. */
+  /** Matched the user's `keepTools`. */
+  | 'user_keep'
+  /** Matched the user's `removeTools`. */
+  | 'user_remove'
+  /** A later call reads, edits, re-runs or re-fetches the same target. */
+  | 'superseded'
+  /** The information is in the workspace. */
+  | 'workspace'
+  /** The latest result of running something: trimmed to its head and tail. */
+  | 'outcome'
+  /** Found outside the workspace and not repeated since: kept. */
+  | 'research'
+  /** No rule applied; the model judged the details still useful. */
+  | 'model_keep'
+  /** No rule applied; the model judged them not needed. */
+  | 'model_trim'
+  /** No rule applied and the model could not be asked: trimmed. */
   | 'model_unavailable';
 
 export interface CallDecision {
@@ -72,39 +90,45 @@ export interface CallDecision {
   tool: string;
   action: CallAction;
   reason: DecisionReason;
-  cost: RerunCost;
-  /** The model's P(expensive to re-run), when it was asked. */
-  pExpensive?: number;
+  category: CallCategory;
+  /** The model's P(still useful), when it was asked. */
+  pUseful?: number;
 }
 
 export interface CompactOptions {
   /** Newest messages never touched (the first message is always kept). Default 6. */
   preserveRecentMessages?: number;
-  /** Minimum model P(expensive) for an unclassified result to be spared. Default 0.7. */
-  spareThreshold?: number;
-  /** Extra tool-name globs whose output is cheap to get again (win over defaults). */
-  cheapTools?: readonly string[];
-  /** Extra tool-name globs whose output is expensive to get again (win over defaults). */
-  expensiveTools?: readonly string[];
+  /** Minimum model P(still useful) for an unclassified result to be kept whole. Default 0.85. */
+  keepThreshold?: number;
+  /** Tool-name globs always removed (win over the rules). */
+  removeTools?: readonly string[];
+  /** Tool-name globs always kept (win over the rules and `removeTools`). */
+  keepTools?: readonly string[];
+  /** Leave a one-line trace where calls were removed. Default true. */
+  breadcrumbs?: boolean;
+  /** Characters kept from the start of a trimmed result. Default 300. */
+  trimHeadChars?: number;
+  /** Characters kept from the end of a trimmed result. Default 300. */
+  trimTailChars?: number;
+  /** Characters kept of each long string input field of a trimmed call. Default 300. */
+  trimInputChars?: number;
   /** Characters of a call's result shown to the model. Default 1500. */
   focusResultChars?: number;
   /** Decision items sent per server request. Default 128. */
   maxRequestItems?: number;
-  /** Characters of a dropped tool result to retain. Default 300. */
-  truncateHeadChars?: number;
-  /** Characters kept of each long string input field of a dropped call. Default 300. */
-  truncateInputChars?: number;
 }
 
 export interface ResolvedCompactOptions {
   preserveRecentMessages: number;
-  spareThreshold: number;
-  cheapTools: readonly string[];
-  expensiveTools: readonly string[];
+  keepThreshold: number;
+  removeTools: readonly string[];
+  keepTools: readonly string[];
+  breadcrumbs: boolean;
+  trimHeadChars: number;
+  trimTailChars: number;
+  trimInputChars: number;
   focusResultChars: number;
   maxRequestItems: number;
-  truncateHeadChars: number;
-  truncateInputChars: number;
 }
 
 export interface CompactResult {
@@ -117,9 +141,10 @@ export interface CompactResult {
     charsBefore: number;
     charsAfter: number;
     calls: number;
-    /** Results left verbatim (spared or pinned). */
+    /** Calls left untouched (kept or pinned). */
     kept: number;
-    resultsDropped: number;
+    trimmed: number;
+    removed: number;
     pinned: number;
     /** Candidates a rule decided without the model. */
     byRule: number;

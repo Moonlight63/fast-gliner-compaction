@@ -77,20 +77,22 @@ function optionList(options: PluginOptions, key: string): string[] | undefined {
 export function resolveHookConfig(options: PluginOptions): HookConfig {
   const numbers: Pick<
     CompactOptions,
-    | 'spareThreshold'
+    | 'keepThreshold'
     | 'preserveRecentMessages'
     | 'focusResultChars'
     | 'maxRequestItems'
-    | 'truncateHeadChars'
-    | 'truncateInputChars'
+    | 'trimHeadChars'
+    | 'trimTailChars'
+    | 'trimInputChars'
   > = {};
   for (const key of [
-    'spareThreshold',
+    'keepThreshold',
     'preserveRecentMessages',
     'focusResultChars',
     'maxRequestItems',
-    'truncateHeadChars',
-    'truncateInputChars',
+    'trimHeadChars',
+    'trimTailChars',
+    'trimInputChars',
   ] as const) {
     const value = options[key];
     if (typeof value === 'number' && Number.isFinite(value)) numbers[key] = value;
@@ -108,10 +110,11 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
   };
   const serverToken = optionString(options, 'serverToken');
   if (serverToken) config.serverToken = serverToken;
-  const cheapTools = optionList(options, 'cheapTools');
-  if (cheapTools) config.cheapTools = cheapTools;
-  const expensiveTools = optionList(options, 'expensiveTools');
-  if (expensiveTools) config.expensiveTools = expensiveTools;
+  const removeTools = optionList(options, 'removeTools');
+  if (removeTools) config.removeTools = removeTools;
+  const keepTools = optionList(options, 'keepTools');
+  if (keepTools) config.keepTools = keepTools;
+  if (typeof options.breadcrumbs === 'boolean') config.breadcrumbs = options.breadcrumbs;
   return config;
 }
 
@@ -200,7 +203,7 @@ export type SessionCompaction = {
 
 /**
  * Runs the library over a session transcript. A failing decision server does
- * not throw: unclassified results are kept and `result.stats.modelError` says why.
+ * not throw: unplaced results are trimmed and `result.stats.modelError` says why.
  */
 export async function compactSession(
   messages: readonly SessionMessage[],
@@ -222,14 +225,15 @@ function percent(ratio: number): string {
 
 export function summarize(result: CompactResult): string {
   const { stats } = result;
-  const spared = stats.kept - stats.pinned;
+  const kept = stats.kept - stats.pinned;
   const parts = [
-    stats.resultsDropped > 0 ? `${stats.resultsDropped} results truncated` : '',
-    spared > 0 ? `${spared} spared as expensive` : '',
+    stats.removed > 0 ? `${stats.removed} removed` : '',
+    stats.trimmed > 0 ? `${stats.trimmed} trimmed` : '',
+    kept > 0 ? `${kept} kept` : '',
     stats.pinned > 0 ? `${stats.pinned} pinned` : '',
   ].filter(Boolean);
   const model = stats.modelError
-    ? `model unavailable, ${stats.calls - stats.pinned - stats.byRule} unclassified kept (${stats.modelError})`
+    ? `model unavailable, ${stats.calls - stats.pinned - stats.byRule} unplaced trimmed (${stats.modelError})`
     : `${stats.byRule} by rule, ${stats.byModel} by model in ${stats.modelMs}ms`;
   return `${percent(reductionRatio(result))} reduction; ${parts.join(', ') || 'no tool calls'}; ${model}`;
 }
@@ -241,7 +245,7 @@ export function decisionLog(result: CompactResult): string {
     .filter((d) => d.reason !== 'pinned')
     .map(
       (d) =>
-        `${d.id}:${d.tool}:${d.action}/${d.reason}${d.pExpensive === undefined ? '' : `=${d.pExpensive.toFixed(2)}`}`,
+        `${d.id}:${d.tool}:${d.action}/${d.reason}${d.pUseful === undefined ? '' : `=${d.pUseful.toFixed(2)}`}`,
     )
     .join(' ');
 }
