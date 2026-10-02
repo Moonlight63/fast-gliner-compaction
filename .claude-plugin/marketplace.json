@@ -1,5 +1,6 @@
 {
   "name": "fast-gliner-compaction",
+  "description": "Removal-first, usefulness-judged compaction for Claude Code, backed by a self-hosted GLiNER2.5 decision server.",
   "owner": {
     "name": "Dalen Catt"
   },
