@@ -1,6 +1,6 @@
 {
   "name": "fast-gliner-compaction",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Verbatim context compaction for LLM agents, scored by a self-hosted GLiNER2.5 decision model.",
   "type": "module",
   "license": "MIT",
@@ -24,7 +24,8 @@
     "test": "vitest run",
     "typecheck:hooks": "tsc -p tsconfig.hooks.json",
     "validate:plugin": "claude plugin validate .claude-plugin/plugin.json",
-    "eval": "tsx scripts/eval.ts"
+    "eval": "tsx scripts/eval.ts",
+    "test:engine": "claude plugin test ."
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

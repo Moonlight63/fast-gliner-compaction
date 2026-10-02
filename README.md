@@ -203,6 +203,7 @@ To develop from a checkout: `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin
 ```sh
 npm install
 npm run typecheck
-npm test                 # fake decider, no server needed
+npm test                 # vitest specs (tests/*.spec.ts), fake decider, no server needed
+npm run test:engine      # tests/engine/*.test.ts inside Claude Code's own plugin runtime
 npm run validate:plugin
 ```

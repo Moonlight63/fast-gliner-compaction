@@ -1,6 +1,6 @@
 {
   "name": "fast-gliner-compaction",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Removal-first compaction for Claude Code sessions: tool calls whose information is in the workspace or superseded are removed, run outcomes are trimmed, research is kept; a self-hosted GLiNER2.5 classifier judges the rest.",
   "author": {
     "name": "Dalen Catt"

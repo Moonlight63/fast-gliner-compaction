@@ -278,22 +278,19 @@ type EnvAccess = {
   settings: { read: () => Promise<Readonly<Record<string, unknown>>> };
 };
 
-/** An environment value from the process, then from settings.json `env`. */
-async function getEnv($: EnvAccess, name: string): Promise<string | undefined> {
-  const fromEnv = await $.env.get(name);
-  if (fromEnv) return fromEnv;
-  const settings = await $.settings.read();
+/** A settings.json `env` value, for variables the process was started without. */
+function settingsEnv(settings: Readonly<Record<string, unknown>>, name: string): string | undefined {
   const env = settings['env'];
-  if (env && typeof env === 'object') {
-    const value = (env as Record<string, unknown>)[name];
-    if (typeof value === 'string' && value) return value;
-  }
-  return undefined;
+  if (!env || typeof env !== 'object') return undefined;
+  const value = (env as Record<string, unknown>)[name];
+  return typeof value === 'string' && value ? value : undefined;
 }
 
 /**
  * Plugin options win; `FGC_SERVER_URL` / `FGC_TOKEN` fill in what they leave
- * unset, so a remote GPU host can be configured once in settings.json.
+ * unset (process environment, then settings.json `env`), so a remote GPU host
+ * can be configured once. `$.env.get` takes literal names only: the engine
+ * lists the variables a module reads from them.
  */
 async function withServerEnv(
   $: EnvAccess,
@@ -301,11 +298,14 @@ async function withServerEnv(
   config: HookConfig,
 ): Promise<HookConfig> {
   const resolved = { ...config };
+  // Only a fallback source: compaction must not fail because settings are unreadable.
+  const settings = await $.settings.read().catch(() => ({}));
   if (!optionString(options, 'serverUrl')) {
-    resolved.serverUrl = (await getEnv($, 'FGC_SERVER_URL')) ?? config.serverUrl;
+    resolved.serverUrl =
+      (await $.env.get('FGC_SERVER_URL')) ?? settingsEnv(settings, 'FGC_SERVER_URL') ?? config.serverUrl;
   }
   if (!config.serverToken) {
-    const token = await getEnv($, 'FGC_TOKEN');
+    const token = (await $.env.get('FGC_TOKEN')) ?? settingsEnv(settings, 'FGC_TOKEN');
     if (token) resolved.serverToken = token;
   }
   return resolved;

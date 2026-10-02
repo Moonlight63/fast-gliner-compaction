@@ -9,7 +9,7 @@
       "name": "fast-gliner-compaction",
       "source": "./",
       "description": "Removal-first compaction for Claude Code sessions: workspace and superseded tool calls are removed, run outcomes trimmed, research kept.",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "license": "MIT"
     }
   ]
